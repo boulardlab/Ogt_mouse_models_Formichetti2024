@@ -1,0 +1,724 @@
+{
+    "a_galaxy_workflow": "true",
+    "annotation": "",
+    "format-version": "0.1",
+    "name": "SE_TranscriptCount_1",
+    "steps": {
+        "0": {
+            "annotation": "",
+            "content_id": null,
+            "errors": null,
+            "id": 0,
+            "input_connections": {},
+            "inputs": [
+                {
+                    "description": "",
+                    "name": "list of single-end fastq files"
+                }
+            ],
+            "label": "list of single-end fastq files",
+            "name": "Input dataset collection",
+            "outputs": [],
+            "position": {
+                "left": 0.0,
+                "top": 0
+            },
+            "tool_id": null,
+            "tool_state": "{\"optional\": false, \"tag\": null, \"collection_type\": \"list\"}",
+            "tool_version": null,
+            "type": "data_collection_input",
+            "uuid": "c7099bad-8fc0-4587-9102-4a1c8803cd48",
+            "when": null,
+            "workflow_outputs": []
+        },
+        "1": {
+            "annotation": "",
+            "content_id": null,
+            "errors": null,
+            "id": 1,
+            "input_connections": {},
+            "inputs": [
+                {
+                    "description": "",
+                    "name": "transcriptome fasta"
+                }
+            ],
+            "label": "transcriptome fasta",
+            "name": "Input dataset",
+            "outputs": [],
+            "position": {
+                "left": 0.0,
+                "top": 73.02499389648438
+            },
+            "tool_id": null,
+            "tool_state": "{\"optional\": false, \"tag\": null}",
+            "tool_version": null,
+            "type": "data_input",
+            "uuid": "7ef4c9ca-da92-4be2-8f43-89e753d8c40a",
+            "when": null,
+            "workflow_outputs": []
+        },
+        "2": {
+            "annotation": "",
+            "content_id": "toolshed.g2.bx.psu.edu/repos/devteam/fastqc/fastqc/0.73+galaxy0",
+            "errors": null,
+            "id": 2,
+            "input_connections": {
+                "input_file": {
+                    "id": 0,
+                    "output_name": "output"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "adapters"
+                },
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "contaminants"
+                },
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "limits"
+                }
+            ],
+            "label": null,
+            "name": "FastQC",
+            "outputs": [
+                {
+                    "name": "html_file",
+                    "type": "html"
+                },
+                {
+                    "name": "text_file",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 195.6500244140625,
+                "top": 0
+            },
+            "post_job_actions": {
+                "RenameDatasetActionhtml_file": {
+                    "action_arguments": {
+                        "newname": "#{input_file | basename}_raw_fastqc"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "html_file"
+                },
+                "RenameDatasetActiontext_file": {
+                    "action_arguments": {
+                        "newname": "#{input_file | basename}_raw_fastqc"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "text_file"
+                }
+            },
+            "tool_id": "toolshed.g2.bx.psu.edu/repos/devteam/fastqc/fastqc/0.73+galaxy0",
+            "tool_shed_repository": {
+                "changeset_revision": "3d0c7bdf12f5",
+                "name": "fastqc",
+                "owner": "devteam",
+                "tool_shed": "toolshed.g2.bx.psu.edu"
+            },
+            "tool_state": "{\"adapters\": {\"__class__\": \"RuntimeValue\"}, \"contaminants\": {\"__class__\": \"RuntimeValue\"}, \"input_file\": {\"__class__\": \"ConnectedValue\"}, \"kmers\": \"7\", \"limits\": {\"__class__\": \"RuntimeValue\"}, \"min_length\": null, \"nogroup\": false, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.73+galaxy0",
+            "type": "tool",
+            "uuid": "9dbbdfc3-809f-4916-b0a3-8dfbdbdc2772",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "html_file",
+                    "uuid": "682f416b-c792-451f-830c-f94e87b841e7"
+                },
+                {
+                    "label": null,
+                    "output_name": "text_file",
+                    "uuid": "74340899-fd9c-4ec4-8d09-80e40a105936"
+                }
+            ]
+        },
+        "3": {
+            "annotation": "",
+            "content_id": "toolshed.g2.bx.psu.edu/repos/pjbriggs/trimmomatic/trimmomatic/0.36.6",
+            "errors": null,
+            "id": 3,
+            "input_connections": {
+                "readtype|fastq_in": {
+                    "id": 0,
+                    "output_name": "output"
+                }
+            },
+            "inputs": [],
+            "label": null,
+            "name": "Trimmomatic",
+            "outputs": [
+                {
+                    "name": "fastq_out",
+                    "type": "input"
+                },
+                {
+                    "name": "log_file",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 195.6500244140625,
+                "top": 200.98748779296875
+            },
+            "post_job_actions": {
+                "RenameDatasetActionfastq_out": {
+                    "action_arguments": {
+                        "newname": "#{fastq_in | basename}_trim.fastq"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "fastq_out"
+                },
+                "RenameDatasetActionlog_file": {
+                    "action_arguments": {
+                        "newname": "#{fastq_in | basename}_trim_log.txt"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "log_file"
+                }
+            },
+            "tool_id": "toolshed.g2.bx.psu.edu/repos/pjbriggs/trimmomatic/trimmomatic/0.36.6",
+            "tool_shed_repository": {
+                "changeset_revision": "59054f086eca",
+                "name": "trimmomatic",
+                "owner": "pjbriggs",
+                "tool_shed": "toolshed.g2.bx.psu.edu"
+            },
+            "tool_state": "{\"illuminaclip\": {\"do_illuminaclip\": true, \"__current_case__\": 0, \"adapter_type\": {\"standard_or_custom\": \"standard\", \"__current_case__\": 0, \"adapter_fasta\": \"TruSeq3-SE.fa\"}, \"seed_mismatches\": \"2\", \"palindrome_clip_threshold\": \"30\", \"simple_clip_threshold\": \"10\", \"min_adapter_len\": \"8\", \"keep_both_reads\": true}, \"operations\": [{\"__index__\": 0, \"operation\": {\"name\": \"SLIDINGWINDOW\", \"__current_case__\": 0, \"window_size\": \"4\", \"required_quality\": \"20\"}}], \"output_err\": false, \"output_logs\": true, \"readtype\": {\"single_or_paired\": \"se\", \"__current_case__\": 0, \"fastq_in\": {\"__class__\": \"ConnectedValue\"}}, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.36.6",
+            "type": "tool",
+            "uuid": "6b3a9a0c-d84a-4d21-b43d-a403fb4a3330",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "log_file",
+                    "uuid": "7cc82963-586b-40b4-b06e-ceb922e91713"
+                },
+                {
+                    "label": null,
+                    "output_name": "fastq_out",
+                    "uuid": "54ec2938-3589-4c20-b62a-f0ba4f2c30f5"
+                }
+            ]
+        },
+        "4": {
+            "annotation": "",
+            "content_id": "dataset-exporter",
+            "errors": null,
+            "id": 4,
+            "input_connections": {
+                "collection": {
+                    "id": 2,
+                    "output_name": "html_file"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool Dataset Exporter",
+                    "name": "datasets"
+                }
+            ],
+            "label": "Exporting raw fastqc output to the /g/boulard/Projects/NAMEOFTHEPROJECT folder on the cluster",
+            "name": "Dataset Exporter",
+            "outputs": [
+                {
+                    "name": "log",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 415.42498779296875,
+                "top": 0
+            },
+            "post_job_actions": {
+                "DeleteIntermediatesActionlog": {
+                    "action_arguments": {},
+                    "action_type": "DeleteIntermediatesAction",
+                    "output_name": "log"
+                }
+            },
+            "tool_id": "dataset-exporter",
+            "tool_state": "{\"collection\": {\"__class__\": \"ConnectedValue\"}, \"datasets\": {\"__class__\": \"RuntimeValue\"}, \"dry_run\": false, \"group_readonly\": false, \"options\": {\"selection_mode\": \"advanced\", \"__current_case__\": 1, \"file_pattern\": \"/g/{group}/Projects/{history}/data/sequencing/qc/{name}_raw_fastqc.html\", \"copy_extra_files\": false, \"export_metadata\": false}, \"primary_group\": true, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.8.0",
+            "type": "tool",
+            "uuid": "b495dfc3-4165-4fe9-81b2-15a8d5fe731f",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "log",
+                    "uuid": "f67cd1ad-0b3e-4008-990c-7af715239777"
+                }
+            ]
+        },
+        "5": {
+            "annotation": "",
+            "content_id": "dataset-exporter",
+            "errors": null,
+            "id": 5,
+            "input_connections": {
+                "collection": {
+                    "id": 2,
+                    "output_name": "text_file"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool Dataset Exporter",
+                    "name": "datasets"
+                }
+            ],
+            "label": "Exporting raw fastqc output 2 to the /g/boulard/Projects/NAMEOFTHEPROJECT folder on the cluster",
+            "name": "Dataset Exporter",
+            "outputs": [
+                {
+                    "name": "log",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 415.42498779296875,
+                "top": 154.10000610351562
+            },
+            "post_job_actions": {
+                "DeleteIntermediatesActionlog": {
+                    "action_arguments": {},
+                    "action_type": "DeleteIntermediatesAction",
+                    "output_name": "log"
+                }
+            },
+            "tool_id": "dataset-exporter",
+            "tool_state": "{\"collection\": {\"__class__\": \"ConnectedValue\"}, \"datasets\": {\"__class__\": \"RuntimeValue\"}, \"dry_run\": false, \"group_readonly\": false, \"options\": {\"selection_mode\": \"advanced\", \"__current_case__\": 1, \"file_pattern\": \"/g/{group}/Projects/{history}/data/sequencing/qc/{name}_raw_fastqc.txt\", \"copy_extra_files\": false, \"export_metadata\": false}, \"primary_group\": true, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.8.0",
+            "type": "tool",
+            "uuid": "2a48c06c-65eb-4a2c-b4d2-55ce21c713b5",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "log",
+                    "uuid": "0383e890-5cf3-491b-9aa0-0845e30049a0"
+                }
+            ]
+        },
+        "6": {
+            "annotation": "",
+            "content_id": "toolshed.g2.bx.psu.edu/repos/devteam/fastqc/fastqc/0.73+galaxy0",
+            "errors": null,
+            "id": 6,
+            "input_connections": {
+                "input_file": {
+                    "id": 3,
+                    "output_name": "fastq_out"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "adapters"
+                },
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "contaminants"
+                },
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "limits"
+                }
+            ],
+            "label": null,
+            "name": "FastQC",
+            "outputs": [
+                {
+                    "name": "html_file",
+                    "type": "html"
+                },
+                {
+                    "name": "text_file",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 415.42498779296875,
+                "top": 308.1875
+            },
+            "post_job_actions": {
+                "RenameDatasetActionhtml_file": {
+                    "action_arguments": {
+                        "newname": "#{input_file | basename}_fastqc"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "html_file"
+                },
+                "RenameDatasetActiontext_file": {
+                    "action_arguments": {
+                        "newname": "#{input_file | basename}_fastqc"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "text_file"
+                }
+            },
+            "tool_id": "toolshed.g2.bx.psu.edu/repos/devteam/fastqc/fastqc/0.73+galaxy0",
+            "tool_shed_repository": {
+                "changeset_revision": "3d0c7bdf12f5",
+                "name": "fastqc",
+                "owner": "devteam",
+                "tool_shed": "toolshed.g2.bx.psu.edu"
+            },
+            "tool_state": "{\"adapters\": {\"__class__\": \"RuntimeValue\"}, \"contaminants\": {\"__class__\": \"RuntimeValue\"}, \"input_file\": {\"__class__\": \"ConnectedValue\"}, \"kmers\": \"7\", \"limits\": {\"__class__\": \"RuntimeValue\"}, \"min_length\": null, \"nogroup\": false, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.73+galaxy0",
+            "type": "tool",
+            "uuid": "92f5dfd0-2460-484f-93f7-83b2617288fc",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "text_file",
+                    "uuid": "27327443-560f-4593-a22b-131248db8618"
+                },
+                {
+                    "label": null,
+                    "output_name": "html_file",
+                    "uuid": "99f88df9-1657-4cb9-bb54-628077a8fc57"
+                }
+            ]
+        },
+        "7": {
+            "annotation": "",
+            "content_id": "toolshed.g2.bx.psu.edu/repos/bgruening/salmon/salmon/0.8.2",
+            "errors": null,
+            "id": 7,
+            "input_connections": {
+                "refTranscriptSource|ownFile": {
+                    "id": 1,
+                    "output_name": "output"
+                },
+                "single_or_paired|input_singles": {
+                    "id": 3,
+                    "output_name": "fastq_out"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool Salmon",
+                    "name": "geneMap"
+                }
+            ],
+            "label": null,
+            "name": "Salmon",
+            "outputs": [
+                {
+                    "name": "output_quant",
+                    "type": "tabular"
+                },
+                {
+                    "name": "output_gene_quant",
+                    "type": "tabular"
+                },
+                {
+                    "name": "output_sam",
+                    "type": "sam"
+                }
+            ],
+            "position": {
+                "left": 415.42498779296875,
+                "top": 509.20001220703125
+            },
+            "post_job_actions": {
+                "RenameDatasetActionoutput_gene_quant": {
+                    "action_arguments": {
+                        "newname": "#{input_singles | basename}_Salmon_gene_quant.txt"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "output_gene_quant"
+                },
+                "RenameDatasetActionoutput_quant": {
+                    "action_arguments": {
+                        "newname": "#{input_singles | basename}_Salmon_quant.txt"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "output_quant"
+                },
+                "RenameDatasetActionoutput_sam": {
+                    "action_arguments": {
+                        "newname": "#{input_singles | basename}_Salmon.sam"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "output_sam"
+                }
+            },
+            "tool_id": "toolshed.g2.bx.psu.edu/repos/bgruening/salmon/salmon/0.8.2",
+            "tool_shed_repository": {
+                "changeset_revision": "53e9709776a0",
+                "name": "salmon",
+                "owner": "bgruening",
+                "tool_shed": "toolshed.g2.bx.psu.edu"
+            },
+            "tool_state": "{\"adv\": {\"writeMappings\": true, \"incompatPrior\": \"1e-20\", \"dumpEq\": false, \"gcSizeSamp\": \"1\", \"biasSpeedSamp\": \"5\", \"strictIntersect\": false, \"minLen\": \"19\", \"sensitive\": false, \"consistentHits\": false, \"extraSensitive\": false, \"coverage\": \"0.7\", \"fldMax\": \"1000\", \"fldMean\": \"200\", \"fldSD\": \"80\", \"forgettingFactor\": \"0.65\", \"maxOcc\": \"200\", \"initUniform\": false, \"maxReadOcc\": \"100\", \"noEffectiveLengthCorrection\": false, \"noFragLengthDist\": false, \"noBiasLengthThreshold\": false, \"numBiasSamples\": \"2000000\", \"numAuxModelSamples\": \"5000000\", \"numPreAuxModelSamples\": \"1000000\", \"splitWidth\": \"0\", \"splitSpanningSeeds\": false, \"useVBOpt\": false, \"numGibbsSamples\": \"0\", \"numBootstraps\": \"0\", \"perTranscriptPrior\": false, \"vbPrior\": \"0.001\", \"writeUnmappedNames\": false}, \"gcBias\": true, \"geneMap\": {\"__class__\": \"RuntimeValue\"}, \"perfectHash\": false, \"quasi_orphans\": {\"type\": \"quasi\", \"__current_case__\": 0}, \"refTranscriptSource\": {\"TranscriptSource\": \"history\", \"__current_case__\": 1, \"ownFile\": {\"__class__\": \"ConnectedValue\"}, \"kmerLen\": \"31\"}, \"sasamp\": \"1\", \"seqBias\": false, \"single_or_paired\": {\"single_or_paired_opts\": \"single\", \"__current_case__\": 0, \"input_singles\": {\"__class__\": \"ConnectedValue\"}, \"strandedness\": \"SR\"}, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.8.2",
+            "type": "tool",
+            "uuid": "fa10123e-0bcc-485b-aa53-ef4f4c88c429",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "output_gene_quant",
+                    "uuid": "fa20cfd2-5517-4531-a345-d9c7131a55d8"
+                },
+                {
+                    "label": null,
+                    "output_name": "output_sam",
+                    "uuid": "3b6f3c32-1c9b-480a-a6ae-71d130297d99"
+                },
+                {
+                    "label": null,
+                    "output_name": "output_quant",
+                    "uuid": "74b13aec-54aa-4dc1-bb5d-ef87d98fd8bb"
+                }
+            ]
+        },
+        "8": {
+            "annotation": "",
+            "content_id": "dataset-exporter",
+            "errors": null,
+            "id": 8,
+            "input_connections": {
+                "collection": {
+                    "id": 6,
+                    "output_name": "html_file"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool Dataset Exporter",
+                    "name": "datasets"
+                }
+            ],
+            "label": "Exporting trimmed fastqc output to the /g/boulard/Projects/NAMEOFTHEPROJECT folder on the cluster",
+            "name": "Dataset Exporter",
+            "outputs": [
+                {
+                    "name": "log",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 635.1625366210938,
+                "top": 0
+            },
+            "post_job_actions": {
+                "DeleteIntermediatesActionlog": {
+                    "action_arguments": {},
+                    "action_type": "DeleteIntermediatesAction",
+                    "output_name": "log"
+                }
+            },
+            "tool_id": "dataset-exporter",
+            "tool_state": "{\"collection\": {\"__class__\": \"ConnectedValue\"}, \"datasets\": {\"__class__\": \"RuntimeValue\"}, \"dry_run\": false, \"group_readonly\": false, \"options\": {\"selection_mode\": \"advanced\", \"__current_case__\": 1, \"file_pattern\": \"/g/{group}/Projects/{history}/data/sequencing/qc/{name}_trim_fastqc.html\", \"copy_extra_files\": false, \"export_metadata\": false}, \"primary_group\": true, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.8.0",
+            "type": "tool",
+            "uuid": "31ed964f-c204-48f9-95a2-c9b41aab3a92",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "log",
+                    "uuid": "7f869e1b-64a7-4d81-ac81-e6d1d345b9cc"
+                }
+            ]
+        },
+        "9": {
+            "annotation": "",
+            "content_id": "dataset-exporter",
+            "errors": null,
+            "id": 9,
+            "input_connections": {
+                "collection": {
+                    "id": 6,
+                    "output_name": "text_file"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool Dataset Exporter",
+                    "name": "datasets"
+                }
+            ],
+            "label": "Exporting trimmed fastqc output 2 to the /g/boulard/Projects/NAMEOFTHEPROJECT folder on the cluster",
+            "name": "Dataset Exporter",
+            "outputs": [
+                {
+                    "name": "log",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 635.1625366210938,
+                "top": 154.10000610351562
+            },
+            "post_job_actions": {
+                "DeleteIntermediatesActionlog": {
+                    "action_arguments": {},
+                    "action_type": "DeleteIntermediatesAction",
+                    "output_name": "log"
+                }
+            },
+            "tool_id": "dataset-exporter",
+            "tool_state": "{\"collection\": {\"__class__\": \"ConnectedValue\"}, \"datasets\": {\"__class__\": \"RuntimeValue\"}, \"dry_run\": false, \"group_readonly\": false, \"options\": {\"selection_mode\": \"advanced\", \"__current_case__\": 1, \"file_pattern\": \"/g/{group}/Projects/{history}/data/sequencing/qc/{name}_trim_fastqc.txt\", \"copy_extra_files\": false, \"export_metadata\": false}, \"primary_group\": true, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.8.0",
+            "type": "tool",
+            "uuid": "e5821e8d-4cf9-40a4-8c50-4bed66db04e4",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "log",
+                    "uuid": "11066c41-fe4d-4413-ba78-6cc39e4b71eb"
+                }
+            ]
+        },
+        "10": {
+            "annotation": "",
+            "content_id": "dataset-exporter",
+            "errors": null,
+            "id": 10,
+            "input_connections": {
+                "collection": {
+                    "id": 7,
+                    "output_name": "output_quant"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool Dataset Exporter",
+                    "name": "datasets"
+                }
+            ],
+            "label": "Exporting Salmon transcript count output to the /g/boulard/Projects/NAMEOFTHEPROJECT folder on the cluster",
+            "name": "Dataset Exporter",
+            "outputs": [
+                {
+                    "name": "log",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 635.1625366210938,
+                "top": 308.1875
+            },
+            "post_job_actions": {
+                "DeleteIntermediatesActionlog": {
+                    "action_arguments": {},
+                    "action_type": "DeleteIntermediatesAction",
+                    "output_name": "log"
+                }
+            },
+            "tool_id": "dataset-exporter",
+            "tool_state": "{\"collection\": {\"__class__\": \"ConnectedValue\"}, \"datasets\": {\"__class__\": \"RuntimeValue\"}, \"dry_run\": false, \"group_readonly\": false, \"options\": {\"selection_mode\": \"advanced\", \"__current_case__\": 1, \"file_pattern\": \"/g/{group}/Projects/{history}/data/sequencing/Salmon/{name}_Salmon_quant.txt\", \"copy_extra_files\": false, \"export_metadata\": false}, \"primary_group\": true, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.8.0",
+            "type": "tool",
+            "uuid": "120992cd-40b9-4d39-aa5c-706fe8242d06",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "log",
+                    "uuid": "6be80b71-cbc5-4eae-a1b2-3d4bc92d8055"
+                }
+            ]
+        },
+        "11": {
+            "annotation": "",
+            "content_id": "toolshed.g2.bx.psu.edu/repos/devteam/fastqc/fastqc/0.73+galaxy0",
+            "errors": null,
+            "id": 11,
+            "input_connections": {
+                "input_file": {
+                    "id": 7,
+                    "output_name": "output_sam"
+                }
+            },
+            "inputs": [
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "adapters"
+                },
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "contaminants"
+                },
+                {
+                    "description": "runtime parameter for tool FastQC",
+                    "name": "limits"
+                }
+            ],
+            "label": null,
+            "name": "FastQC",
+            "outputs": [
+                {
+                    "name": "html_file",
+                    "type": "html"
+                },
+                {
+                    "name": "text_file",
+                    "type": "txt"
+                }
+            ],
+            "position": {
+                "left": 635.1625366210938,
+                "top": 475.70001220703125
+            },
+            "post_job_actions": {
+                "HideDatasetActiontext_file": {
+                    "action_arguments": {},
+                    "action_type": "HideDatasetAction",
+                    "output_name": "text_file"
+                },
+                "RenameDatasetActionhtml_file": {
+                    "action_arguments": {
+                        "newname": "#{input_file | basename}_fastqc"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "html_file"
+                },
+                "RenameDatasetActiontext_file": {
+                    "action_arguments": {
+                        "newname": "#{input_file | basename}_fastqc"
+                    },
+                    "action_type": "RenameDatasetAction",
+                    "output_name": "text_file"
+                }
+            },
+            "tool_id": "toolshed.g2.bx.psu.edu/repos/devteam/fastqc/fastqc/0.73+galaxy0",
+            "tool_shed_repository": {
+                "changeset_revision": "3d0c7bdf12f5",
+                "name": "fastqc",
+                "owner": "devteam",
+                "tool_shed": "toolshed.g2.bx.psu.edu"
+            },
+            "tool_state": "{\"adapters\": {\"__class__\": \"RuntimeValue\"}, \"contaminants\": {\"__class__\": \"RuntimeValue\"}, \"input_file\": {\"__class__\": \"ConnectedValue\"}, \"kmers\": \"7\", \"limits\": {\"__class__\": \"RuntimeValue\"}, \"min_length\": null, \"nogroup\": false, \"__page__\": null, \"__rerun_remap_job_id__\": null}",
+            "tool_version": "0.73+galaxy0",
+            "type": "tool",
+            "uuid": "9237321c-37c1-4dc5-81d7-8e52a7a693b5",
+            "when": null,
+            "workflow_outputs": [
+                {
+                    "label": null,
+                    "output_name": "html_file",
+                    "uuid": "330b76b2-daa8-4dcf-a60e-9768f7c520d5"
+                }
+            ]
+        }
+    },
+    "tags": [],
+    "uuid": "7cffc5de-4131-4def-9160-b138c71c57e5",
+    "version": 25
+}

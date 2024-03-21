@@ -1,0 +1,622 @@
+---
+title: "AID-Ogt blastocysts mRNA-Seq - analysis prior to RUVSeq"
+date: "January 28, 2022"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide', fig.width=12, fig.height=8)
+
+```
+
+```{r loading needed packages}
+
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library("DESeq2")
+library(ggpubr)
+library(gridExtra)
+library(pheatmap)
+library(ggrepel)
+library(vsn)
+library(RUVSeq)
+
+```
+
+```{r creating tx2gene and geneID2name df}
+
+# Creating the transcriptID2geneID df; the transcriptID2geneID tsv file has been created with custom shell script tx2gene_from_encode_gtf.sh in src/sh folder
+tx2gene <- fread("../../data/annotations/gencode.vM25.annotation.tx2gene.tsv", col.names = c("tx_id", "gene_id"))
+# removing version
+tx2gene <- tx2gene[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(tx2gene)]
+# Adding to the tx2gene DataFrame the transcript-gene pairs corresponding to OsTIR and AID
+tg_tx2gene <- DataFrame(tx_id = paste0(c("AID2xMycFLAG", "OsTIRMycHA"), "_transcript"), gene_id = paste0(c("AID2xMycFLAG", "OsTIRMycHA"), "_gene"))
+tx2gene_w_ex <- rbind(tx2gene, tg_tx2gene)
+
+# Creating the geneID2geneName df; the geneID2geneName tsv file has been created with custom shell script geneID2name_from_encode_gtf.sh in src/sh folder
+geneID2name <- fread("../../data/annotations/gencode.vM25.annotation.geneID2name.tsv", col.names = c("gene_id", "gene_name"))
+# removing version
+geneID2name <- geneID2name[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(geneID2name)]
+# Adding the transgenes
+tg_geneID2name <- DataFrame(gene_id = paste0(c("AID2xMycFLAG", "OsTIRMycHA"), "_gene"), gene_name = paste0(c("AID2xMycFLAG", "OsTIRMycHA"), "_gene"))
+geneID2name_w_ex <- rbind(geneID2name, tg_geneID2name)
+
+# Merging the 2 dfs
+gene_map_dt <- as.data.table(merge(geneID2name_w_ex, tx2gene_w_ex, by = "gene_id"))
+
+```
+
+# Design of the experiment
+
+```{r files path}
+
+# directory containing featureCounts outputs
+dir <- "../../data/sequencing/featureCounts"
+# vector of file names
+files <- grep("_counts", sort(list.files(path = dir)), value = TRUE)
+# Excluding samples A44 and A11 because they got very few number of reads
+files <- files[!(grepl("A44|A11", files))]
+# adding the path
+files_w_path <- file.path(dir, files)
+
+```
+
+```{r reading sample metadata}
+
+# reading table containing sample names and day of collection
+samples_table <- fread("../../data/sequencing/samples_table.csv")
+design_df <- as.data.frame(samples_table)
+rownames(design_df) <- design_df$SAMPLE_NAME
+# Excluding samples A44 and A11 because they got very few number of reads
+design_df <- design_df[!(design_df$SAMPLE_NAME %in% c("A44","A11")), ]
+# Specifying COLLECTION as a discrete variable
+design_df$COLLECTION <- as.character(design_df$COLLECTION)
+
+```
+
+```{r design table, results='asis'}
+
+knitr::kable(table(design_df$CONDITION, design_df$COLLECTION), row.names = TRUE)
+
+```
+
+# Defining samples' genotype and sex
+
+```{r creating DESeqDataSet}
+
+# reading and merging all files in one data.frame by Geneid
+counts_table <- as.data.frame(Reduce(function(...) merge(..., by = c("Geneid")), lapply(files_w_path, function (f) {fread(f)})))
+# simplifying colnames by leaving only the sample name
+names(counts_table) <- gsub(".txt.gz", "", names(counts_table))
+# geneids as row.names are necessary for DESeqDataSet creation; removing version while doing it
+rownames(counts_table) <- gsub("\\..*", "", counts_table$Geneid)
+counts_table$Geneid <- NULL
+# reordering columns based on order in the design df
+counts_table <- counts_table[, rownames(design_df)]
+# creating DESeqDataSet from count table
+dds <- DESeqDataSetFromMatrix(countData = counts_table,
+                              colData = design_df,
+                              design = ~ CONDITION) #the design is not important here, it needs to be provided for function to work but will be changed later after assigning genotypes
+
+```
+
+```{r prefiltering}
+
+# pre-filtering low count genes in order to speed up the following computations
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+```
+
+```{r DESeq function to compute size factors for gene counts}
+
+# the standard differential expression analysis steps are wrapped into a single function, DESeq
+dds <- DESeq(dds)
+
+```
+
+```{r genotyping gene counts}
+
+tg <- tg_tx2gene$gene_id
+names(tg) <- tg_tx2gene$gene_id
+
+sexing_genes <- gene_map_dt[gene_name %in% c("Ddx3y", "Xist"), unique(gene_id)]
+names(sexing_genes) <- gene_map_dt[gene_name %in% c("Ddx3y", "Xist"), unique(gene_name)]
+
+get_norm_dds_counts <- function (my_gene_id, my_dds, my_design_df) {
+  return(plotCounts(dds, gene = my_gene_id, intgroup = colnames(my_design_df), returnData = TRUE, normalized = TRUE))
+}
+
+genotyping_gene_counts_list <- lapply(c(sexing_genes, tg), get_norm_dds_counts, my_dds = dds, my_design_df = design_df)
+sfx <- paste0(".", names(c(sexing_genes, tg)))
+genotyping_gene_counts <- genotyping_gene_counts_list[[1]]
+for(i in head(seq_along(genotyping_gene_counts_list), n = -1L)) {
+ genotyping_gene_counts <- merge(genotyping_gene_counts, genotyping_gene_counts_list[[i+1]],
+                            all = TRUE, 
+                            suffixes = sfx[i:(i+1)], 
+                            by = c("SAMPLE_NAME", "COLLECTION", "CONDITION"))
+}
+
+```
+
+```{r genotyping read counts}
+
+# reading the read counts for chrY (only uniquely mapped), chrX (only uniquely mapped), AID2xMycFLAG (only uniquely mapped) and the total number of uniquely mapped reads
+chrY_counts <- fread("../../data/sequencing/alignment/STAR/genotyping_read_counts/chrY.tabular")
+chrX_counts <- fread("../../data/sequencing/alignment/STAR/genotyping_read_counts/chrX.tabular")
+AID_counts <- fread("../../data/sequencing/alignment/STAR/genotyping_read_counts/AID.tabular")
+tot_counts <- fread("../../data/sequencing/alignment/STAR/genotyping_read_counts/total_uniquely_mapped.tabular")
+# binding all tables
+genotyping_read_counts <- Reduce(function(...) merge(...,by = "Sample"), list(chrY_counts, chrX_counts, AID_counts, tot_counts))
+names(genotyping_read_counts)[2:5] <- c("chrY", "chrX", "AID_reads", "tot_uniquely_mapped")
+genotyping_read_counts[ , paste0(names(genotyping_read_counts)[2:4], "_CPM") := list((chrY/tot_uniquely_mapped)*10^6, (chrX/tot_uniquely_mapped)*10^6, (AID_reads/tot_uniquely_mapped)*10^6)]
+genotyping_read_counts[ , "sex_CPM" := list(chrX_CPM/chrY_CPM)]
+genotyping_read_counts$SAMPLE_NAME <- gsub(".txt.gz", "", genotyping_read_counts$Sample)
+
+```
+
+```{r plot genotyping counts, include = TRUE}
+
+# merging genotyping gene and read counts dt
+genotyping_counts <- merge(genotyping_gene_counts, genotyping_read_counts[, c("SAMPLE_NAME", "AID_reads", grep("_CPM", names(genotyping_read_counts), value = TRUE)), with = FALSE], by = "SAMPLE_NAME")
+
+ggplot(genotyping_counts,aes(x = AID_reads, y = count.AID2xMycFLAG_gene, colour = COLLECTION, label = SAMPLE_NAME)) + 
+  geom_point(size = 5) +
+  geom_text_repel(size = 7) +
+  ggtitle("Plot to establish threshold for AID read counts\nto use for assigning genotype") +
+  theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+ggplot(genotyping_counts) + 
+  geom_histogram(aes(AID_reads), bins = 20) +
+  ggtitle("Plot to establish threshold for AID expression values") +
+  theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+ggplot(genotyping_counts,aes(x = count.Ddx3y, y = sex_CPM, colour = COLLECTION, label = SAMPLE_NAME)) +
+  geom_point(size = 5) +
+  geom_text_repel(size = 7) +
+  ggtitle("Plot to understand best parameters to use for sex assignment") +
+  theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+ggplot(genotyping_counts,aes(x = count.Ddx3y, y = count.Xist, colour = COLLECTION, label = SAMPLE_NAME)) +
+  geom_point(size = 5) +
+  geom_text_repel(size = 7) +
+  ggtitle("Plot to understand best parameters to use for sex assignment") +
+  theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+ggplot(genotyping_counts,aes(x = count.OsTIRMycHA_gene, y = count.AID2xMycFLAG_gene, colour = COLLECTION, label = SAMPLE_NAME)) + 
+  geom_point(size = 5) +
+  geom_text_repel(size = 7) +
+  scale_y_log10() +
+  scale_x_continuous(breaks = c(10, 50, 100, 200, 300), labels = c(10, 50, 100, 200, 300), limits = c(0, 500)) +
+  ggtitle("Plot to pick embryos to eventually exclude because of no OsTIR expression") +
+  theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+```
+
+Based on the plot above, I decide to proceed as follows:
+
+* assigning ***genotype*** based on threshold on raw sum of reads mapping to AID2xMycFLAG exogenous sequence: sample is defined as wild-type if sum of AID reads <72
+* assigning ***sex*** based on threshold on normalized counts of chrY-mapping gene Ddx3y (inspired by [Groff et al., Genome Research 2019](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6771404/)): sample is defined as Male if Ddx3y counts >30
+* excluding sample A60 as sex-uncertain
+
+```{r assigning genotype and sex}
+
+# Assigning genotype based on threshold on raw sum of reads mapping to AID2xMycFLAG exogenous sequence
+genotyping_counts$genotype <- ifelse(genotyping_counts$AID_reads < 72, "wt", "AID-Ogt")
+
+# Assigning sex based on threshold on Ddx3y normalized gene counts
+genotyping_counts$sex <- ifelse(genotyping_counts$count.Ddx3y < 30, "F", "M")
+
+# Excluding low-OsTIR-expressing samples and uncertain samples
+genotyping_counts <- genotyping_counts[genotyping_counts$SAMPLE_NAME != "A60", ]
+# removing them also from counts table
+counts_table <- counts_table[, colnames(counts_table) != "A60"]
+
+# Merging genotypings df with design df
+design_df <- merge(design_df, genotyping_counts[, c("SAMPLE_NAME", "sex", "genotype")], all = FALSE, by = "SAMPLE_NAME")
+# re-putting sample names as row names
+rownames(design_df) <- design_df$SAMPLE_NAME
+# re-reordering columns based on order in the design df and removing AID counts
+counts_table <- counts_table[!grepl("AID", rownames(counts_table)), rownames(design_df)]
+
+```
+
+```{r creating group factors}
+
+design_df$sex_geno <- paste0(design_df$sex, "_", design_df$genotype)
+design_df$group <- paste0(design_df$sex_geno, "_", design_df$CONDITION)
+
+```
+
+```{r removing previous dds}
+
+rm(dds)
+
+```
+
+```{r defining adj pval cutoff}
+
+adjpvalue_cutoff <- 0.05
+
+```
+
+```{r rebuilding DESeq dataset using genotyping info}
+
+# Re-creating dds object with new design after genotyping
+dds <- DESeqDataSetFromMatrix(countData = counts_table,
+                              colData = design_df,
+                              design = ~ group) #again, the design is not important here, it needs to be provided for function to work but will be changed later after assigning genotypes
+# pre-filtering low count genes in order to speed up the following computations
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+# saving this dds containing all samples for gene counts plots
+save(dds, file = "Rdata/dds_all.Rdata")
+
+```
+
+# Quality assessment and sample clustering
+
+After applying the log2(n + 1) transformation, I plot heatmaps of normalized counts for top highly expressed genes to check for eventual big sample heterogeneity present in the dataset. 
+
+```{r pheatmap for quality assessment, include = TRUE}
+
+highest_expr_hm <- function (my_dds, my_title) {
+  select <- order(rowMeans(counts(my_dds, normalized = FALSE)), decreasing = TRUE)[1:30]
+  design_df_h <- as.data.frame(colData(my_dds)[,c("sex_geno","CONDITION", "COLLECTION")])
+  my_ntd <- normTransform(my_dds)
+  pheatmap(assay(my_ntd)[select,], cluster_rows = FALSE, show_rownames = TRUE,
+         cluster_cols = TRUE, annotation_col = design_df_h, main = my_title)
+}
+
+highest_expr_hm(dds, my_title = "")
+
+```
+
+The heatmap shows that the samples cluster first of all by collection point - and that collection point 4 is particularly on its own. Since the blastocysts were also looking a bit less healthy in general in that batch, I first of all exclude collection 4 from the analysis. The number of genotypes I would end up with before and after removing collection 4 can be deduced from the following:
+
+```{r nr of genotypes, results='asis'}
+
+lapply(as.character(1:length(unique(design_df$COLLECTION))), function (i) {knitr::kable(table(design_df[design_df$COLLECTION == i, ]$sex_geno, design_df[design_df$COLLECTION == i, ]$CONDITION), row.names = TRUE, caption = paste0("COLLECTION ", i))})
+
+```
+
+```{r removing previous dds 2}
+
+rm(dds)
+
+```
+
+## PCA
+
+```{r defining threshold}
+
+my_threshold = 1000
+
+```
+
+* PCA that uses the ranks of the first `r my_threshold` ranks of raw counts, colored by collection batch, to see whether the batch effect is visible. 
+* The plot shows that there is indeed a batch effect, especially between the first and the fifth collection.
+
+```{r PCA of ranks 1, include = TRUE}
+
+library(ade4)
+library(factoextra)
+library(sva)
+
+# Removing collection 4 and pre-filtering low count genes
+counts_table_f <- counts_table[, colnames(counts_table) %in% design_df[design_df$COLLECTION != "4", "SAMPLE_NAME"]]
+keep <- rowSums(counts_table_f) >= 10
+counts_table_f <- counts_table_f[keep, ]
+
+# Function which uses the ranks of the first "threshold" genes to do pca. It returns the PCA object
+rankthresholdPCA <- function (x, threshold = my_threshold) {
+  ranksM <- apply(x, 2, rank)
+  ranksM[ranksM < threshold] = threshold
+  ranksM = threshold - ranksM
+  dudi.pca(t(ranksM), scannf = FALSE, nf = 2)
+}
+pca_ranks <- rankthresholdPCA(counts_table_f)
+batch <- factor(design_df[design_df$COLLECTION != "4", "COLLECTION"])
+group <- factor(design_df[design_df$COLLECTION != "4", "group"])
+condition <- factor(design_df[design_df$COLLECTION != "4", "CONDITION"])
+
+fviz(pca_ranks, element = "ind", axes = c(1,2), geom = c("point", "text"), habillage = batch, repel = TRUE, palette = "Dark2", addEllipses = TRUE, ellipse.type = "convex") + ggtitle("PCA of first 1000 ranks of raw values") + coord_fixed()
+
+```
+
+I will try to remove the **unwanted variation linked with the batch of collection** using package ***RUVSeq***. 
+
+## Removing unwanted variation due to batch of collection using RUVSeq
+
+* It would be very complicated for RUVSeq to remove the unwanted variation due to batch effect when mixed with the unwanted variation due to the AUX treatment itself even on wt samples (plot not shown but done). Therefore, I run RUVSeq separately on AUX-treated and untreated samples.
+* I choose ***RUVg***, which uses a set of control genes (i.e. genes that do not change because of the biological factor of interest) to compute the unwanted factors.
+
+```{r finding least DEGs}
+
+# Function which finds the list of least DEGs genes for each condition
+least_DEGs_by_condition <- function (my_condition, my_counts_table, my_design_df) {
+  # subsetting design df 
+  design_df_s <- my_design_df[my_design_df$COLLECTION != "4" & my_design_df$CONDITION == my_condition, ]
+  dds <- DESeqDataSetFromMatrix(countData = my_counts_table[, names(my_counts_table) %in% design_df_s$SAMPLE_NAME],
+                              colData = design_df_s,
+                              design = ~ sex_geno)
+  keep <- rowSums(counts(dds)) >= 10
+  dds <- dds[keep,]
+  # first-pass DE analysis prior to RUVseq
+  dds <- DESeq(dds)
+  # results of first-pass DE analysis
+  res_list_firstPassDE <- list(
+    res_F = lfcShrink(dds, contrast=c("sex_geno","F_AID-Ogt","F_wt"), alpha=adjpvalue_cutoff, type="ashr"),
+    res_M = lfcShrink(dds, contrast=c("sex_geno","M_AID-Ogt","M_wt"), alpha=adjpvalue_cutoff, type="ashr"),
+    res_sex_wt = lfcShrink(dds, contrast=c("sex_geno","M_wt","F_wt"), alpha=adjpvalue_cutoff, type="ashr"),
+    res_sex_mut = lfcShrink(dds, contrast=c("sex_geno","M_AID-Ogt","F_AID-Ogt"), alpha=adjpvalue_cutoff, type="ashr")
+)
+  # function which takes least DEGs in all results
+  least_DEGs <- function (res) {
+  rownames(res[res$baseMean > 100 & res$padj > 0.8 & abs(res$log2FoldChange) < 0.05, ])
+}
+  least_DEGs_list <- lapply(res_list_firstPassDE, least_DEGs)
+  least_DEGs_int <- Reduce(intersect, least_DEGs_list)
+  return(least_DEGs_int)
+}
+
+list_least_DEGs_by_condition <- lapply(c("AUX", "UNT"), least_DEGs_by_condition, my_design_df = design_df, my_counts_table = counts_table)
+
+# Storing the list of least DEGs genes common to both conditions
+min_list_least_DEGs <- Reduce(intersect, list_least_DEGs_by_condition)
+
+```
+
+```{r expression dataset for RUVg by condition}
+
+## AUX
+
+# Removing collection 4, choosing condition and pre-filtering low count genes
+counts_table_AUX <- counts_table[, colnames(counts_table) %in% design_df[design_df$COLLECTION != "4" & design_df$CONDITION == "AUX", "SAMPLE_NAME"]]
+keep <- rowSums(counts_table_AUX) >= 10
+counts_table_AUX <- counts_table_AUX[keep, ]
+AUX_design_df <- design_df[design_df$COLLECTION != "4" & design_df$CONDITION == "AUX", ]
+# Building expression set for RUVSeq
+phenoData_AUX <- data.frame(group = AUX_design_df$sex_geno, COLLECTION = AUX_design_df$COLLECTION, row.names = colnames(counts_table_AUX))
+# order by group
+phenoData_AUX <- phenoData_AUX[(order(phenoData_AUX$group)), ]
+# group color variable
+phenoData_AUX$color_group <- factor(phenoData_AUX$group, labels = c("red", "pink", "blue", "lightblue"))
+# order by collection
+phenoData_AUX <- phenoData_AUX[(order(phenoData_AUX$COLLECTION)), ]
+# collection color variable
+phenoData_AUX$color_collection <- factor(phenoData_AUX$COLLECTION)
+# next two rows are necessary for the colors I gave to be plotted
+phenoData_AUX$color_group <- as.character(phenoData_AUX$color_group)
+phenoData_AUX$color_collection <- as.character(phenoData_AUX$color_collection)
+ses_AUX <- newSeqExpressionSet(as.matrix(counts_table_AUX[, rownames(phenoData_AUX)]), # order of samples in counts table need to be the same as in phenoData
+                              phenoData = phenoData_AUX)
+
+## UNT
+
+counts_table_UNT <- counts_table[, colnames(counts_table) %in% design_df[design_df$COLLECTION != "4" & design_df$CONDITION == "UNT", "SAMPLE_NAME"]]
+keep <- rowSums(counts_table_UNT) >= 10
+counts_table_UNT <- counts_table_UNT[keep, ]
+UNT_design_df <- design_df[design_df$COLLECTION != "4" & design_df$CONDITION == "UNT", ]
+# Building expression set for RUVSeq
+phenoData_UNT <- data.frame(group = UNT_design_df$sex_geno, COLLECTION = UNT_design_df$COLLECTION, row.names = colnames(counts_table_UNT))
+# order by group
+phenoData_UNT <- phenoData_UNT[(order(phenoData_UNT$group)), ]
+# group color variable
+phenoData_UNT$color_group <- factor(phenoData_UNT$group, labels = c("red", "pink", "blue", "lightblue"))
+# order by collection
+phenoData_UNT <- phenoData_UNT[(order(phenoData_UNT$COLLECTION)), ]
+# collection color variable
+phenoData_UNT$color_collection <- factor(phenoData_UNT$COLLECTION)
+# next two rows are necessary for the colors I gave to be plotted
+phenoData_UNT$color_group <- as.character(phenoData_UNT$color_group)
+phenoData_UNT$color_collection <- as.character(phenoData_UNT$color_collection)
+ses_UNT <- newSeqExpressionSet(as.matrix(counts_table_UNT[, rownames(phenoData_UNT)]), # order of samples in counts table need to be the same as in phenoData
+                              phenoData = phenoData_UNT)
+
+```
+
+### RUVg effect, untreated blastocysts
+
+```{r RUVg UNT, include = TRUE}
+
+ses1_UNT <- RUVg(ses_UNT, min_list_least_DEGs, k = 2)
+ses2_UNT <- RUVg(ses_UNT, min_list_least_DEGs, k = 3)
+ses3_UNT <- RUVg(ses_UNT, min_list_least_DEGs, k = 4)
+ses4_UNT <- RUVg(ses_UNT, min_list_least_DEGs, k = 5)
+ses5_UNT <- RUVg(ses_UNT, min_list_least_DEGs, k = 6)
+
+plotPCA(ses_UNT, col=pData(ses_UNT)$color_collection, cex=1.2, labels = FALSE, main = "original counts - coloured by COLLECTION", k = 3)
+plotPCA(ses_UNT, col=pData(ses_UNT)$color_group, cex=1.2, labels = FALSE, main = "original counts - coloured by GROUP", k = 3)
+plotPCA(ses1_UNT, col=pData(ses1_UNT)$color_collection, cex=1.2, labels = FALSE, main = "k=2 - coloured by COLLECTION", k = 3)
+plotPCA(ses1_UNT, col=pData(ses1_UNT)$color_group, cex=1.2, labels = FALSE, main = "k=2 - coloured by GROUP", k = 3)
+plotPCA(ses2_UNT, col=pData(ses2_UNT)$color_collection, cex=1.2, labels = FALSE, main = "k=3 - coloured by COLLECTION", k = 3)
+plotPCA(ses2_UNT, col=pData(ses2_UNT)$color_group, cex=1.2, labels = FALSE, main = "k=3 - coloured by GROUP", k = 3)
+plotPCA(ses3_UNT, col=pData(ses3_UNT)$color_collection, cex=1.2, labels = FALSE, main = "k=4 - coloured by COLLECTION", k = 3)
+plotPCA(ses3_UNT, col=pData(ses3_UNT)$color_group, cex=1.2, labels = FALSE, main = "k=4 - coloured by GROUP", k = 3)
+plotPCA(ses4_UNT, col=pData(ses4_UNT)$color_collection, cex=1.2, labels = FALSE, main = "k=5 - coloured by COLLECTION", k = 3)
+plotPCA(ses4_UNT, col=pData(ses4_UNT)$color_group, cex=1.2, labels = FALSE, main = "k=5 - coloured by GROUP", k = 3)
+plotPCA(ses5_UNT, col=pData(ses5_UNT)$color_collection, cex=1.2, labels = FALSE, main = "k=6 - coloured by COLLECTION", k = 3)
+plotPCA(ses5_UNT, col=pData(ses5_UNT)$color_group, cex=1.2, labels = FALSE, main = "k=6 - coloured by GROUP", k = 3)
+
+plotRLE(ses_UNT, col=pData(ses_UNT)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "original counts")
+plotRLE(ses1_UNT, col=pData(ses1_UNT)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=2")
+plotRLE(ses2_UNT, col=pData(ses2_UNT)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=3")
+plotRLE(ses3_UNT, col=pData(ses3_UNT)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=4")
+plotRLE(ses4_UNT, col=pData(ses4_UNT)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=5")
+plotRLE(ses5_UNT, col=pData(ses5_UNT)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=6")
+
+```
+
+### RUVg effect, AUX-treated blastocysts 
+
+```{r RUVg AUX, include = TRUE}
+
+ses1_AUX <- RUVg(ses_AUX, min_list_least_DEGs, k = 2)
+ses2_AUX <- RUVg(ses_AUX, min_list_least_DEGs, k = 3)
+ses3_AUX <- RUVg(ses_AUX, min_list_least_DEGs, k = 4)
+ses4_AUX <- RUVg(ses_AUX, min_list_least_DEGs, k = 5)
+ses5_AUX <- RUVg(ses_AUX, min_list_least_DEGs, k = 6)
+
+plotPCA(ses_AUX, col=pData(ses_AUX)$color_collection, cex=1.2, labels = FALSE, main = "original counts - coloured by COLLECTION", k = 3)
+plotPCA(ses_AUX, col=pData(ses_AUX)$color_group, cex=1.2, labels = FALSE, main = "original counts - coloured by GROUP", k = 3)
+plotPCA(ses1_AUX, col=pData(ses1_AUX)$color_collection, cex=1.2, labels = FALSE, main = "k=2 - coloured by COLLECTION", k = 3)
+plotPCA(ses1_AUX, col=pData(ses1_AUX)$color_group, cex=1.2, labels = FALSE, main = "k=2 - coloured by GROUP", k = 3)
+plotPCA(ses2_AUX, col=pData(ses2_AUX)$color_collection, cex=1.2, labels = FALSE, main = "k=3 - coloured by COLLECTION", k = 3)
+plotPCA(ses2_AUX, col=pData(ses2_AUX)$color_group, cex=1.2, labels = FALSE, main = "k=3 - coloured by GROUP", k = 3)
+plotPCA(ses3_AUX, col=pData(ses3_AUX)$color_collection, cex=1.2, labels = FALSE, main = "k=4 - coloured by COLLECTION", k = 3)
+plotPCA(ses3_AUX, col=pData(ses3_AUX)$color_group, cex=1.2, labels = FALSE, main = "k=4 - coloured by GROUP", k = 3)
+plotPCA(ses4_AUX, col=pData(ses4_AUX)$color_collection, cex=1.2, labels = FALSE, main = "k=5 - coloured by COLLECTION", k = 3)
+plotPCA(ses4_AUX, col=pData(ses4_AUX)$color_group, cex=1.2, labels = FALSE, main = "k=5 - coloured by GROUP", k = 3)
+plotPCA(ses5_AUX, col=pData(ses5_AUX)$color_collection, cex=1.2, labels = FALSE, main = "k=6 - coloured by COLLECTION", k = 3)
+plotPCA(ses5_AUX, col=pData(ses5_AUX)$color_group, cex=1.2, labels = FALSE, main = "k=6 - coloured by GROUP", k = 3)
+
+plotRLE(ses_AUX, col=pData(ses_AUX)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "original counts")
+plotRLE(ses1_AUX, col=pData(ses1_AUX)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=2")
+plotRLE(ses2_AUX, col=pData(ses2_AUX)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=3")
+plotRLE(ses3_AUX, col=pData(ses3_AUX)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=4")
+plotRLE(ses4_AUX, col=pData(ses4_AUX)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=5")
+plotRLE(ses5_AUX, col=pData(ses5_AUX)$color_collection, ylim=c(-4, 4), outline = FALSE, main = "k=6")
+
+```
+
+Setting **k=6 in the UNT samples and k=3 in the AUX treated samples** looks like the minimal number of k in order to have the separation between batches no more visible in the PCA. Let's confirm this using the PCA of ranks as done above.
+
+```{r PCA of ranks 2 function}
+
+rank_PCA_RUVg_UNT <- lapply(list(counts(ses_UNT), normCounts(ses2_UNT), normCounts(ses3_UNT), normCounts(ses4_UNT), normCounts(ses5_UNT)), rankthresholdPCA)
+names(rank_PCA_RUVg_UNT) <- c("original", "k=3", "k=4", "k=5", "k=6")
+rank_PCA_RUVg_AUX <- lapply(list(counts(ses_AUX), normCounts(ses2_AUX), normCounts(ses3_AUX), normCounts(ses4_AUX), normCounts(ses5_AUX)), rankthresholdPCA)
+names(rank_PCA_RUVg_AUX) <- c("original", "k=3", "k=4", "k=5", "k=6")
+
+pca_fviz_w_groups <- function (i, pca_res_list, my_group_factor) {
+  fviz(pca_res_list[[i]], element = "ind", axes = c(1,2), geom = c("point", "text"), habillage = my_group_factor, repel = TRUE, palette = "Dark2", addEllipses = TRUE, ellipse.type = "convex") + coord_fixed() + ggtitle(names(pca_res_list)[i])
+}
+
+batch_AUX <- factor(AUX_design_df$COLLECTION)
+batch_UNT <- factor(UNT_design_df$COLLECTION)
+sex_geno_AUX <- factor(AUX_design_df$sex_geno)
+sex_geno_UNT <- factor(UNT_design_df$sex_geno)
+
+```
+
+### RUVg effect using PCA of ranks, untreated blastocysts 
+
+```{r PCA of ranks 2 plots UNT, include = TRUE}
+
+par(mfrow=c(2,5))
+lapply(1:length(rank_PCA_RUVg_UNT), pca_fviz_w_groups, my_group_factor = batch_UNT, pca_res_list = rank_PCA_RUVg_UNT)
+lapply(1:length(rank_PCA_RUVg_UNT), pca_fviz_w_groups, my_group_factor = sex_geno_UNT, pca_res_list = rank_PCA_RUVg_UNT)
+
+```
+
+### RUVg effect using PCA of ranks, AUX-treated blastocysts
+
+```{r PCA of ranks 2 plots AUX, include = TRUE}
+
+par(mfrow=c(2,5))
+lapply(1:length(rank_PCA_RUVg_AUX), pca_fviz_w_groups, my_group_factor = batch_AUX, pca_res_list = rank_PCA_RUVg_AUX)
+lapply(1:length(rank_PCA_RUVg_AUX), pca_fviz_w_groups, my_group_factor = sex_geno_AUX, pca_res_list = rank_PCA_RUVg_AUX)
+
+```
+
+## Conclusion
+
+I will perform a DESeq analysis in parallel in the two following ways:
+
+1. without removing unwanted variation
+2. by using a design matrix that includes both the covariates of interest and the factors of unwanted variation computed by RUVg.
+
+The analysis will proceed in the Rmd file **DE_analysis_from_featureCounts_post_RUVSeq.Rmd**.
+
+```{r saving objects needed for next Rmd}
+
+save(design_df, file = "Rdata/design_df.Rdata")
+save(ses4_AUX, file = "Rdata/ses4_AUX.Rdata")
+save(ses4_UNT, file = "Rdata/ses4_UNT.Rdata")
+save(ses5_AUX, file = "Rdata/ses5_AUX.Rdata")
+save(ses5_UNT, file = "Rdata/ses5_UNT.Rdata")
+save(tx2gene_w_ex, file = "Rdata/tx2gene_w_ex.Rdata")
+save(geneID2name_w_ex, file = "Rdata/geneID2name_w_ex.Rdata")
+save(gene_map_dt, file = "Rdata/gene_map_dt.Rdata")
+
+```
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

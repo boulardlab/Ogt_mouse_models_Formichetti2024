@@ -1,0 +1,8 @@
+# exclude markers and samples' metadata
+*
+!README.md
+!.gitignore
+!sequencing/
+sequencing/*
+!sequencing/placenta_markers/
+!sequencing/samples_table.csv

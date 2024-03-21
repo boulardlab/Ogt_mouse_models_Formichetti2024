@@ -1,0 +1,500 @@
+---
+title: "SMART-Seq2 mRNA-Seq of blastocysts from wt M PWD x F FVB OgtT931A-het or OgtT931del-het/wt - DE analysis"
+date: "January 19th, 2024"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide', fig.width=12, fig.height=8)
+
+```
+
+```{r loading needed packages}
+
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library("DESeq2")
+library(ggpubr)
+library(gridExtra)
+library(ggrepel)
+library(vsn)
+library(dplyr)
+
+```
+
+```{r function to retrieve gene names res DESeq2}
+
+retrieve_res_names <- function (r) {
+  res_df <- data.frame(gene_id = rownames(r))
+  res_df <- merge(res_df, unique(gene_map_dt[, .(gene_name, gene_id)]), all.x = TRUE, by = "gene_id")
+  res_df$gene_name[is.na(res_df$gene_name)] <- res_df$gene_id[is.na(res_df$gene_name)]
+  return(res_df)
+}
+
+```
+
+```{r function to customize plots DESeq2}
+
+pval_hist <- function (dds_res) {
+  ggplot(as(dds_res, "data.frame"), aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.01, fill = "Royalblue", boundary = 0) +
+  ggtitle(gsub(" vs ", "\nvs ", gsub(".*: ", "", mcols(dds_res)$description[4]))) +
+  scale_x_continuous(breaks=c(0.0, 0.5, 1)) +
+  theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20),
+        title = element_text(size = 18),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        legend.key.height = unit(1.5,"line"))
+}
+
+custom_MA_plot <- function(my_dds_res, adjpval_to_color, l2fc_to_label, baseMean_to_label, ylim) {
+  # adding label to genes which are significant and expressed above defined thresholds - labels are gene names
+  my_res_names_df <- retrieve_res_names(my_dds_res)
+  my_dds_res$to_label <- ""
+  my_dds_res$to_label[!is.na(my_dds_res$padj) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label)] <- my_res_names_df$gene_name[!is.na(my_dds_res$padj) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label)]
+  # adding color to genes which are significant and expressed above defined thresholds
+  my_dds_res$to_color <- ""
+  my_dds_res$to_color[my_dds_res$padj < adjpval_to_color] <- paste0("adjpval < ", adjpval_to_color)
+  dt_to_plot <- as.data.table(my_dds_res)
+  ggplot(dt_to_plot, aes(x = baseMean, y = log2FoldChange)) +
+    geom_point(aes(color = to_color), alpha = 0.8) +
+    geom_text_repel(aes(label = to_label), size = 3, max.overlaps = 40) +
+    scale_x_log10() +
+    ylim(ylim) +
+    scale_color_manual(values = c("grey", "blue")) +
+    ggtitle(gsub(".*: ", "", mcols(my_dds_res)$description[4])) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 20),
+          legend.position = "none",
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+```
+
+```{r functions to get and order DESeq results}
+
+# Function which takes a DESeq results object and return it as a dataframe, with genes ordered by pvalue and with gene names added; furthermore it writes this dataframe to a file if desired
+pvalue_ranked_DE <- function (my_res, my_DE_dir, writeToFile, my_adjpval, my_gene_name_mapping_table) {
+  # getting name of contrast
+  contrast_name <- gsub(" ", "_", gsub(".*: ", "", mcols(my_res)$description[4]))
+  # removing genes for which padj is NA
+  my_res <- my_res[!(is.na(my_res$padj)), ]
+  # merging the dataframe with the gene names
+  my_res$gene_id <- row.names(my_res)
+  my_res <- merge(as.data.frame(my_res), my_gene_name_mapping_table, by = "gene_id", all.x = TRUE)
+  # ordering by pvalue
+  my_res_ord <- my_res[order(my_res$pvalue),]
+  # keeping only the ones with padj below desired threshold
+  my_res_ord_f <- my_res_ord[my_res_ord$padj < my_adjpval, ]
+  # writing them to file
+  if (writeToFile) {
+    # creating output directory if it does not exist
+    system(paste0("[ -d ", my_DE_dir, " ] || mkdir -p ", my_DE_dir))
+    write.csv(my_res_ord_f, file=paste0(my_DE_dir, contrast_name, "_DEG_by_pvalue.csv"))
+  }
+  return(my_res_ord_f)
+}
+
+```
+
+```{r loading R objs}
+
+load("Rdata/design_df.Rdata")
+load("Rdata/gene_map_dt.Rdata")
+load("Rdata/counts_table.Rdata")
+load("Rdata/geneID2name.Rdata")
+
+```
+
+```{r cutoff values}
+
+adjpvalue_cutoff <- 0.05
+baseMean_cutoff_to_label <- 10
+
+```
+
+```{r DE dir}
+
+# Defining export directory
+DE_dir <- "../../analysis/DESeq/"
+
+```
+
+# Ogt expression
+
+```{r building dds}
+
+# creating variable that is combination of genotype of mother and genotype of embryo
+design_df$group <- paste0(design_df$group_or_time_point, ".", design_df$condition)
+
+dds <- DESeqDataSetFromMatrix(countData = counts_table,
+                              colData = design_df,
+                              design = ~ group_or_time_point) #not important now
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+dds <- DESeq(dds)
+
+```
+
+```{r plot gene counts Ogt (FIGURE), include = TRUE}
+
+my_protagonists <- c(Ogt = "ENSMUSG00000034160")
+
+my_plotCounts <- function (g, my_GOIs, my_dds) {
+  if (sum(grepl(my_GOIs[g], my_dds@rowRanges@partitioning@NAMES)) > 0) {
+      d <- plotCounts(my_dds, gene = my_GOIs[g], intgroup = c("group", "sex", "genotype", "group_or_time_point", "sample"), returnData = TRUE)
+      d$group <- factor(d$group, levels = c("wt_or_T931del_IVF.F_U", "T931A_IVF.F_wt", "wt_or_T931del_IVF.F_del", "T931A_IVF.F_T931A", "wt_or_T931del_IVF.M_wt", "T931A_IVF.M_wt", "wt_or_T931del_IVF.M_del", "T931A_IVF.M_T931A"))
+    ggplot(d, aes(x = group, y = count)) + 
+      geom_point(aes(color = sex, shape = group_or_time_point), position=position_jitter(w=0.1,h=0), size = 3, alpha = .6) +
+      stat_summary(aes(group = group, color = sex), fun = "mean", geom = "crossbar", width = 0.5) +
+      ggtitle(names(my_GOIs)[g]) +
+      theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19, angle = 60, vjust = 0.5, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+  }
+}
+
+my_plotCounts(1, my_protagonists, my_dds = dds)
+
+```
+
+In good agreement with PCA separation between embryos' genotypes found only in male samples, Ogt "compensatory change" is mostly visible in male samples.
+
+# DESeq2 - between "IVF drops", to investigate batch effect, separately for the two sexes
+
+Number of replicates (single embryos) is too little for the males, females are more informative.
+
+```{r DE batch effect}
+
+# dds only wt embryos
+dds_wt <- DESeqDataSetFromMatrix(countData = counts_table[, colnames(counts_table) %in% design_df$sample[design_df$genotype %in% c("wt", "U")]],
+                              colData = design_df[design_df$genotype %in% c("wt", "U"), ],
+                              design = ~ group)
+# pre-filtering low count genes in order to speed up the following computations
+keep <- rowSums(counts(dds_wt)) >= 10
+dds_wt <- dds_wt[keep,]
+
+dds_wt <- DESeq(dds_wt)
+
+res_IVF_type_F = lfcShrink(dds_wt, contrast=c("group","T931A_IVF.F_wt","wt_or_T931del_IVF.F_U"), alpha=adjpvalue_cutoff, type="ashr")
+
+```
+
+## MA-plots
+
+The threshold used for a dot to be colored in red in the MA-plots is: p-value adjusted < `r adjpvalue_cutoff`.
+
+```{r pvalue histograms and MA-plots batch effect, include = TRUE}
+
+pval_hist(res_IVF_type_F)
+custom_MA_plot(res_IVF_type_F, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = 0.2, baseMean_to_label = baseMean_cutoff_to_label, ylim = c(-2,2))
+
+```
+
+## Conclusion
+
+Only a few DEGs due to batch effect, hence I can proceed comparing male OgtT931del embryos and male wt embryos, even if most wt embryos come from the pair of OgtT931A-het mothers. 
+
+# DESeq2 - males only, OgtT931del-hemizygous vs wt
+
+* I exclude the two embryos with the point mutations because they are too few.
+* I pool the wt embryos coming from the two IVF drops.
+* I include the IVF drop as batch effect in DESeq formula.
+
+```{r DE male genotypes}
+
+# subsetting counts table
+counts_table_M <- counts_table[, colnames(counts_table) %in% design_df$sample[design_df$sex == "M" & design_df$genotype != "T931A"]]
+# subsetting design df 
+design_df_M <- design_df[design_df$sex == "M" & design_df$genotype != "T931A", ]
+# defining genotype reference level in design df
+design_df_M$genotype <- factor(design_df_M$genotype, levels = c("del", "wt"))
+design_df_M$genotype <- relevel(x = design_df_M$genotype, ref = "wt")
+
+# building dds M only wo T931A embryos
+dds_M <- DESeqDataSetFromMatrix(countData = counts_table_M,
+                              colData = design_df_M,
+                              design = ~ group_or_time_point + genotype)
+# pre-filtering low count genes in order to speed up the following computations
+keep <- rowSums(counts(dds_M)) >= 10
+dds_M <- dds_M[keep,]
+
+dds_M <- DESeq(dds_M)
+
+res_M <- lfcShrink(dds_M, coef="genotype_del_vs_wt", type="ashr")
+
+```
+
+## MA-plots
+
+```{r pvalue histograms and MA-plots males, include = TRUE}
+
+pval_hist(res_M)
+custom_MA_plot(res_M, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = 0.2, baseMean_to_label = baseMean_cutoff_to_label, ylim = c(-4,4))
+
+```
+
+```{r FIGURE MA plot (i.e. with x- and y-lims), include = TRUE, eval = FALSE}
+
+custom_MA_plot <- function(my_dds_res, adjpval_to_color, l2fc_to_label, baseMean_to_label, ylim) {
+  # adding label to genes which are significant and expressed above defined thresholds - labels are gene names
+  my_res_names_df <- retrieve_res_names(my_dds_res)
+  my_dds_res$to_label <- ""
+  my_dds_res$to_label[!is.na(my_dds_res$padj) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label)] <- my_res_names_df$gene_name[!is.na(my_dds_res$padj) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label)]
+  # adding color to genes which are significant and expressed above defined thresholds
+  my_dds_res$to_color <- ""
+  my_dds_res$to_color[my_dds_res$padj < adjpval_to_color] <- paste0("adjpval < ", adjpval_to_color)
+  dt_to_plot <- as.data.table(my_dds_res)
+  ggplot(dt_to_plot, aes(x = baseMean, y = log2FoldChange)) +
+    geom_point(aes(color = to_color), alpha = 0.8) +
+    geom_text_repel(aes(label = to_label), size = 3, max.overlaps = 40) +
+    scale_x_log10(limits = c(10,NA)) +
+    ylim(ylim) +
+    scale_color_manual(values = c("grey", "blue")) +
+    ggtitle(gsub(".*: ", "", mcols(my_dds_res)$description[4])) +
+    theme(axis.text = element_text(size = 16), axis.title = element_text(size = 16), 
+          title = element_text(size = 16),
+          legend.position = "none",
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+custom_MA_plot(my_dds_res = res_M, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = 0.2, baseMean_to_label = baseMean_cutoff_to_label, ylim = c(-2.5,2.5))
+
+```
+
+```{r getting DEGs}
+
+DEGs <- pvalue_ranked_DE(res_M, my_DE_dir = paste0(DE_dir, "M/"), writeToFile = TRUE, my_adjpval = adjpvalue_cutoff, my_gene_name_mapping_table = geneID2name)
+
+```
+
+## DEGs counts
+
+```{r gene counts function}
+
+my_plotCounts <- function (g, my_GOIs, my_dds) {
+  if (sum(grepl(my_GOIs[g], my_dds@rowRanges@partitioning@NAMES)) > 0) {
+      d <- plotCounts(dds, gene = my_GOIs[g], intgroup = c("group", "sex", "group_or_time_point", "sample"), returnData = TRUE)
+      d$group <- factor(d$group, levels = c("wt_or_T931del_IVF.F_U", "T931A_IVF.F_wt", "wt_or_T931del_IVF.F_del", "T931A_IVF.F_T931A", "wt_or_T931del_IVF.M_wt", "T931A_IVF.M_wt", "wt_or_T931del_IVF.M_del", "T931A_IVF.M_T931A"))
+    ggplot(d, aes(x = group, y = count)) + 
+      geom_violin() +
+      geom_point(aes(color = sex, shape = group_or_time_point), position=position_jitter(w=0.1,h=0), size = 2, alpha = .7) +
+      geom_text_repel(aes(label = sample)) +
+      stat_summary(fun = "mean", geom = "crossbar", width = 0.5, colour = "black") +
+      scale_y_log10() +
+      ggtitle(names(my_GOIs)[g]) +
+      theme(title = element_text(size = 12),
+        legend.text = element_text(size = 12), legend.title = element_text(size = 12),
+        axis.text = element_text(size = 12, angle = 60, vjust = 0.5, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+  }
+}
+
+```
+
+```{r M DEGs counts, include = TRUE, fig.height=16, fig.width=16}
+
+DEGs_vector <- setNames(DEGs$gene_id, DEGs$gene_name)
+do.call("ggarrange", args = list(plotlist = lapply(1:10, my_plotCounts, my_dds = dds, my_GOIs = DEGs_vector), common.legend = TRUE, legend = "right"))
+
+```
+
+* In most of the cases, the same trend observed in T931del embryos is observed as well in T931A embryos, supporting the differential expression being due to Ogt disruption.
+* For most of the genes plotted, counts for wt coming from T931A mothers are lower than for wt coming from del/wt mothers, indicating either an effect of mothers' genotype or of the different IVF drop (i.e. experimental batch effect). However, this effect can only dampen the difference between T931del and wt, hence it will not create false positive DEGs but more the opposite.
+
+# Gene Set Enrichment Test
+
+* I remove Ogt from the input list of genes.
+* I also perform the test on DESeq result for female wt embryos when comparing IVF drosp (T931A mothers vs the other pair), in order to compare it with the result obtained for male embryos T931del vs wt.
+
+```{r preparing go data for similarity analysis}
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(GOSemSim)
+
+mmBP <- godata('org.Mm.eg.db', ont="BP")
+mmMF <- godata('org.Mm.eg.db', ont="MF")
+mmCC <- godata('org.Mm.eg.db', ont="CC")
+
+```
+
+```{r GSEA}
+
+# choosing similarity cutoff for simplification of gsea results
+sim_cutoff <- 0.6
+
+### Function which simplifies a gse result by semantic similarity, in the same way it is done by the clusterProfiler::simplify function (which however only takes gseGO results) 
+simplify_gse <- function (my_gse_res, my_semdata, my_sim_cutoff = sim_cutoff) {
+  my_gse_sim <- mgoSim(my_gse_res$ID, my_gse_res$ID, semData=my_semdata, measure="Wang", combine=NULL)
+  my_gse_sim.df <- as.data.frame(my_gse_sim)
+  my_gse_sim.df$go1 <- row.names(my_gse_sim.df)
+  my_gse_sim.df <- reshape2::melt(my_gse_sim.df, id.vars = "go1", variable.name = "go2", value.name = "similarity")
+  my_gse_sim.df <- my_gse_sim.df[!is.na(my_gse_sim.df$similarity),]
+  # adding padj of go1
+  my_gse_sim.df <- merge(my_gse_sim.df, my_gse_res[, c("ID", "p.adjust")], by.x="go1", by.y="ID")
+  # adding padj pf go2
+  my_gse_sim.df$go2 <- as.character(my_gse_sim.df$go2)
+  my_gse_sim.df <- merge(my_gse_sim.df, my_gse_res[, c("ID", "p.adjust")], by.x="go2", by.y="ID", suffixes = c(".go1", ".go2"))
+  # df with IDs which have similarity > cutoff
+  to_remove <- my_gse_sim.df[my_gse_sim.df$similarity > sim_cutoff & my_gse_sim.df$similarity != 1, ]
+  # for each pair of IDs, choosing the one with lowest padj  
+  go1_to_remove <- to_remove[to_remove$p.adjust.go1 >= to_remove$p.adjust.go2, "go1"]
+  go2_to_remove <- to_remove[to_remove$p.adjust.go2 > to_remove$p.adjust.go1, "go2"]
+  my_gse_res_f <- my_gse_res[!(my_gse_res$ID %in% unique(c(go1_to_remove, go2_to_remove))), ]
+  return(my_gse_res_f)
+}
+
+### Function which: creates a vector of -log10(pval)*sign(log2FC) for the DESeq result of a specific comparison, sorted in decreasing order and named with gene ids; uses this vector for Gene Set Enrichment Analsysis using package clusterProfiler; simplify the result by semantic similarity
+perform_all_gsea <- function (my_res) {
+  my_rank_stat <- -log10(my_res[my_res$baseMean > 10, ]$pvalue)*sign(my_res[my_res$baseMean > 10, ]$log2FoldChange)
+  my_gene_list <- setNames(object = my_rank_stat, nm = rownames(my_res[my_res$baseMean > 10, ]))
+  # gene list for GSEA needs to be sorted in decreasing order
+  my_gene_list <- my_gene_list[order(my_gene_list, decreasing = TRUE)]
+  my_gene_list <- na.omit(my_gene_list)
+  BP <- gseGO(geneList=my_gene_list, 
+             ont ="BP", 
+             keyType = "ENSEMBL", 
+             minGSSize = 10, 
+             maxGSSize = 500, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = org.Mm.eg.db, 
+             pAdjustMethod = "BH")
+  BP <- setReadable(BP, OrgDb=org.Mm.eg.db, keyType = "ENSEMBL")
+  BP@result <- simplify_gse(BP, my_semdata = mmBP)
+  MF <- gseGO(geneList=my_gene_list, 
+             ont ="MF", 
+             keyType = "ENSEMBL", 
+             minGSSize = 10, 
+             maxGSSize = 500, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = org.Mm.eg.db, 
+             pAdjustMethod = "BH")
+  MF <- setReadable(MF, OrgDb=org.Mm.eg.db, keyType = "ENSEMBL")
+  MF@result <- simplify_gse(MF, my_semdata = mmMF)
+  CC <- gseGO(geneList=my_gene_list, 
+             ont ="CC", 
+             keyType = "ENSEMBL", 
+             minGSSize = 10, 
+             maxGSSize = 500, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = org.Mm.eg.db, 
+             pAdjustMethod = "BH")
+  CC <- setReadable(CC, OrgDb=org.Mm.eg.db, keyType = "ENSEMBL")
+  CC@result <- simplify_gse(CC, my_semdata = mmCC)
+  return(list(BP, MF, CC))
+}
+
+all_gsea_female_batch <- perform_all_gsea(res_IVF_type_F[rownames(res_IVF_type_F) != "ENSMUSG00000034160", ])
+all_gsea_male <- perform_all_gsea(res_M[rownames(res_M) != "ENSMUSG00000034160", ])
+
+```
+
+```{r table of GSEA, results='asis'}
+
+knitr::kable(as.data.frame(all_gsea_female_batch[[1]]), caption = "Females wt - IVF drop - Biological Process GO")
+knitr::kable(as.data.frame(all_gsea_female_batch[[2]]), caption = "Females wt - IVF drop - Molecular Function GO")
+knitr::kable(as.data.frame(all_gsea_female_batch[[3]]), caption = "Females wt - IVF drop - Cellular Component GO")
+
+knitr::kable(as.data.frame(all_gsea_male[[1]]), caption = "Males - del vs wt - Biological Process GO")
+knitr::kable(as.data.frame(all_gsea_male[[2]]), caption = "Males - del vs wt - Molecular Function GO")
+knitr::kable(as.data.frame(all_gsea_male[[3]]), caption = "Males - del vs wt - Cellular Component GO")
+
+```
+
+```{r GSEA plots, setup, include = TRUE}
+
+dotplot(all_gsea_female_batch[[1]], showCategory=10, split=".sign", title = "Females wt - IVF drop - BP GO", font.size = 10) + facet_grid(.~.sign)
+dotplot(all_gsea_female_batch[[2]], showCategory=10, split=".sign", title = "Females wt - IVF drop - MF GO", font.size = 10) + facet_grid(.~.sign)
+dotplot(all_gsea_female_batch[[3]], showCategory=10, split=".sign", title = "Females wt - IVF drop - CC GO", font.size = 10) + facet_grid(.~.sign)
+dotplot(all_gsea_male[[1]], showCategory=10, split=".sign", title = "Males - del vs wt - BP GO", font.size = 10) + facet_grid(.~.sign)
+dotplot(all_gsea_male[[2]], showCategory=10, split=".sign", title = "Males - del vs wt - MF GO", font.size = 10) + facet_grid(.~.sign)
+dotplot(all_gsea_male[[3]], showCategory=10, split=".sign", title = "Males - del vs wt - CC GO", font.size = 10) + facet_grid(.~.sign)
+
+```
+
+Many significantly enriched gene sets are shared by female blastocysts when comparing IVF drops. This is in agreement with what observed already with DEGs counts: there is an effect - either due to the mothers' genotype or to the IVF drop (experimental batch effect) which acts on a fraction of the genes which are differentially expressed due to the mutation. In particular, these genes are downregulated/upregulated due to the mutation and also downregulated/upregulated when the mother is OgtT931A-het.
+
+# Combined GSEA result
+
+I combine the GSEA results, then show the most significant terms for the male comparison.
+
+```{r combined GSEA plot, include = TRUE}
+
+# combining gsea results
+BP_df <- as.data.table(rbind(fortify(all_gsea_male[[1]], showCategory = nrow(all_gsea_male[[1]]@result)), fortify(all_gsea_female_batch[[1]], showCategory = nrow(all_gsea_female_batch[[1]]@result))))
+BP_df$comparison <- rep(c("male del vs wt", "female wt T931A mothers vs wt-del mothers"), c(nrow(all_gsea_male[[1]]@result), nrow(all_gsea_female_batch[[1]]@result)))
+CC_df <- as.data.table(rbind(fortify(all_gsea_male[[3]], showCategory = nrow(all_gsea_male[[3]]@result)), fortify(all_gsea_female_batch[[3]], showCategory = nrow(all_gsea_female_batch[[3]]@result))))
+CC_df$comparison <- rep(c("male del vs wt", "female wt T931A mothers vs wt-del mothers"), c(nrow(all_gsea_male[[3]]@result), nrow(all_gsea_female_batch[[3]]@result)))
+
+BP_CC_df <- rbind(BP_df, CC_df)
+BP_CC_df$GO <- rep(c("BP", "CC"), c(nrow(BP_df), nrow(CC_df)))
+# computing absolute NES
+BP_CC_df$abs_NES <- abs(BP_CC_df$NES)
+# ordering based on abs NES
+setorder(BP_CC_df, -abs_NES, comparison)
+# taking first GOs of male comparison based on NES
+best_NES_terms <- BP_CC_df[BP_CC_df$comparison == "male del vs wt", .SD[1:20], .SDcols = "ID"]$ID
+red_BP_CC_df <- BP_CC_df[ID %in% best_NES_terms]
+
+library(DOSE)
+library(tidytext)
+
+ggplot(red_BP_CC_df, aes(x = GeneRatio, y = reorder_within(Description, GeneRatio, .sign), color = p.adjust)) +
+      scale_color_continuous(low="red", high="blue", name = "p.adjust", guide = guide_colorbar(reverse=TRUE)) +
+      geom_point(aes(size=setSize)) +
+      scale_y_reordered() +
+      scale_size(range=c(0.5, 5)) +
+      ylab(NULL) +
+      theme_dose(10) +
+      facet_grid(.sign * GO ~ comparison, scales = "free_y") +
+      theme(title = element_text(size = 14),
+            legend.text = element_text(size = 10), legend.title = element_text(size = 8))
+
+```
+
+## Conclusion 
+After looking also manually at the list of enriched terms (since some terms with similar meaning might not appear in the plot because named differently): all cortex-related terms are only appearing in mutant males, as well as cellular aminoacid metabolism and cytoplasmic stress granules; mitochondrial terms are shared and could be associated to a slight developmental delay. The absense of cortex-related terms in batch effect when measured in females could be due to the higher dose of Ogt in trophectoderm due to Ogt escaping imprinted X inactivation in this tissue.
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+

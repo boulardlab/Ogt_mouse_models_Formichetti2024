@@ -1,0 +1,25 @@
+SRR,sample,condition,group_or_time_point,batch,biol_rep,tech_rep,run,library_layout,read_length
+none,P1,F_HET,6,1,1,1,1,PAIRED - ,40
+none,P2,F_HET,7,1,2,1,1,PAIRED - ,40
+none,P3,F_HET,8,1,3,1,1,PAIRED - ,40
+none,P4,F_HOMO,6,1,1,1,1,PAIRED - ,40
+none,P5,F_HOMO,7,1,2,1,1,PAIRED - ,40
+none,P6,F_HOMO,8,1,3,1,1,PAIRED - ,40
+none,P7,M_HEMI,6,1,1,1,1,PAIRED - ,40
+none,P8,M_HEMI,6,1,2,1,1,PAIRED - ,40
+none,P9,M_HEMI,7,1,3,1,1,PAIRED - ,40
+none,P10,M_WT,6,1,1,1,1,PAIRED - ,40
+none,P11,M_WT,7,1,2,1,1,PAIRED - ,40
+none,P12,M_WT,8,1,3,1,1,PAIRED - ,40
+none,P13,F_HET,6,1,4,1,1,PAIRED - ,40
+none,P14,M_WT,7,1,4,1,1,PAIRED - ,40
+none,P15,F_HET,8,1,5,1,1,PAIRED - ,40
+none,P16,F_HOMO,7,1,4,1,1,PAIRED - ,40
+none,P17,F_HOMO,7,1,5,1,1,PAIRED - ,40
+none,P18,F_HOMO,8,1,6,1,1,PAIRED - ,40
+none,P19,M_HEMI,6,1,4,1,1,PAIRED - ,40
+none,P20,M_HEMI,6,1,5,1,1,PAIRED - ,40
+none,P21,M_HEMI,7,1,6,1,1,PAIRED - ,40
+none,P22,M_WT,6,1,5,1,1,PAIRED - ,40
+none,P23,M_WT,6,1,6,1,1,PAIRED - ,40
+none,P24,F_HET,7,1,6,1,1,PAIRED - ,40

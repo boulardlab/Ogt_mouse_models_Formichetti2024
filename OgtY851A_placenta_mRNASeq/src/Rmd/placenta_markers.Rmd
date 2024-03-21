@@ -1,0 +1,201 @@
+---
+title: "Placental markers' expression in OgtY841A-homo males"
+date: "July 03, 2023"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide', fig.width=12, fig.height=8)
+
+```
+
+```{r loading needed packages, echo=FALSE, results='hide'}
+
+library("DESeq2")
+library(ggplot2)
+library("ggrepel")
+library(reshape2)
+library("pheatmap")
+library(ggpubr)
+library(gplots)
+library(gridExtra)
+library(data.table)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+
+```
+
+```{r loading Rdata}
+
+load("Rdata/ddsTxi.Rdata")
+load("Rdata/design_df.Rdata")
+load("Rdata/res_list.Rdata")
+load("Rdata/gene_map_dt.Rdata")
+geneID2name <- unique(gene_map_dt[, .(gene_id, gene_name)])
+
+```
+
+Reading:
+
+* DEGs found in DE_analysis.Rmd
+
+```{r reading DEGs}
+
+#Reading DEGs found in DE_analysis.Rmd
+M_DEGs <- fread("../../analysis/DESeq/M_HEMI_vs_M_WT_DEG_by_pvalue.csv")
+
+```
+
+* markers of placental clusters found in [Marsh and Blelloch, elife 2020](https://elifesciences.org/articles/60266#s2). Number of markers per cluster:
+
+```{r reading placenta markers}
+
+placenta_markers_main <- fread("../../data/placenta_markers/elife-60266-fig1-data1-v2.csv")
+# clusters are numbers - combining them in main clusters based on Fig.1D
+placenta_markers_main$main_cluster <- ifelse(placenta_markers_main$cluster %in% c(8,18,16,0,14,9,12,7,1,2,11,5), "trophoblast", "fetal_mesenchyme")
+placenta_markers_main$main_cluster[placenta_markers_main$cluster %in% c(3,25,26,20)] <- "endothelial"
+placenta_markers_main$main_cluster[placenta_markers_main$cluster %in% c(13,17,21,27,23)] <- "blood"
+placenta_markers_main$main_cluster[placenta_markers_main$cluster == 4] <- "decidual_stroma"
+placenta_markers_main$cluster <- NULL
+names(placenta_markers_main)[ncol(placenta_markers_main)] <- "cluster"
+placenta_markers_tropho_subclusters <- fread("../../data/placenta_markers/elife-60266-fig2-data1-v2.csv")
+placenta_markers <- rbind(placenta_markers_main[placenta_markers_main$cluster != "trophoblast", 2:ncol(placenta_markers_main)], placenta_markers_tropho_subclusters[, 3:ncol(placenta_markers_tropho_subclusters)])
+names(placenta_markers)[ncol(placenta_markers)-1] <- "gene_name" 
+placenta_markers$cluster <- gsub(" ", "", placenta_markers$cluster)
+placenta_markers$cluster <- gsub("-", "_", placenta_markers$cluster)
+
+# when a gene is marker for more than one cluster, selecting the cluster with higher log2FC
+setorder(placenta_markers, gene_name, -avg_logFC)
+placenta_markers_red <- placenta_markers[!(duplicated(placenta_markers$gene_name))]
+
+```
+
+```{r placenta markers table, results='asis'}
+
+table(placenta_markers$cluster)
+
+```
+
+After reducing table in such a way that when a gene is marker for more than one cluster, the cluster with higher log2FC is selected i.e. markers are unique for a cluster:
+
+```{r red placenta markers table, results='asis'}
+
+table(placenta_markers_red$cluster)
+
+```
+
+The list of unique markers will be used for all plots.
+
+# GSEA using placental markers
+
+```{r GSEA placenta markers (FIGURE)}
+
+# create TERM2GENE using dt of placenta markers. genes are gene names hence gene names will be required in geneList given to GSEA
+T2G_placentaMarkers <- data.frame(TermID = placenta_markers_red$cluster, geneID = placenta_markers_red$gene_name)
+
+# get gene names in DESeq2 result
+get_res_w_geneNames <- function (my_res) {
+  my_res$gene_id <- row.names(my_res)
+  return(merge(as.data.frame(my_res), geneID2name, by = "gene_id", all.x = TRUE))
+}
+res_M <- get_res_w_geneNames(res_list$res_M)
+
+### Function which: creates a vector of -log10(pval)*sign(log2FC) for the DESeq result of a specific comparison, sorted in decreasing order and named with gene names; uses this vector for Gene Set Enrichment Analysis using package clusterProfiler and custom gene sets with gene names
+perform_gsea_custom_sets_w_geneNames <- function (my_res, my_T2G) {
+  my_rank_stat <- -log10(my_res[my_res$baseMean > 10, ]$pvalue)*sign(my_res[my_res$baseMean > 10, ]$log2FoldChange)
+  my_gene_list <- setNames(object = my_rank_stat, nm = my_res[my_res$baseMean > 10, ]$gene_name)
+  # gene list for GSEA needs to be sorted in decreasing order
+  my_gene_list <- my_gene_list[order(my_gene_list, decreasing = TRUE)]
+  my_gene_list <- na.omit(my_gene_list)
+  gsea_custom <- GSEA(geneList=my_gene_list, TERM2GENE=my_T2G,
+                      minGSSize = 10, 
+                      maxGSSize = 500, 
+                      pvalueCutoff = 0.05,
+                      eps = 0,
+                      verbose = TRUE, 
+                      pAdjustMethod = "BH")
+  return(gsea_custom)
+}
+gsea_placenta_markers_M <- perform_gsea_custom_sets_w_geneNames(my_res = res_M, my_T2G = T2G_placentaMarkers)
+
+```
+
+```{r GSEA placenta markers plot, include = TRUE}
+
+dotplot(gsea_placenta_markers_M, showCategory=10, split=".sign", font.size = 10) + facet_grid(.~.sign)
+
+```
+
+# Pseudotime using placental markers expression
+
+```{r pseudotime w markers (FIGURE), include = TRUE}
+
+melt_counts <- reshape2::melt(counts(ddsTxi, normalized = TRUE)[rowMeans(counts(ddsTxi, normalized = TRUE)) > 10, ])
+names(melt_counts) <- c("gene_id", "sample", "norm_counts")
+counts_w_design <- merge(melt_counts, design_df[, c("sample", "genotype")], by = "sample")
+counts_w_design <- merge(counts_w_design, geneID2name, by = "gene_id")
+counts_w_design <- merge(counts_w_design, unique(placenta_markers_red[,.(gene_name, cluster)]), by = "gene_name", all.x = TRUE)
+counts_w_design$cluster[is.na(counts_w_design$cluster)] <- "none"
+counts_w_design <- merge(counts_w_design, M_DEGs[,.(gene_name, log2FoldChange)], by = "gene_name", all.x = TRUE)
+counts_w_design$DE_sign <- "non_DE"
+counts_w_design$DE_sign[!(is.na(counts_w_design$log2FoldChange)) & counts_w_design$log2FoldChange > 0] <- "UP"
+counts_w_design$DE_sign[!(is.na(counts_w_design$log2FoldChange)) & counts_w_design$log2FoldChange < 0] <- "DOWN"
+counts_w_design <- as.data.table(counts_w_design)
+
+table(unique(counts_w_design[DE_sign == "UP", .(gene_name, cluster)])$cluster)
+table(unique(counts_w_design[DE_sign == "DOWN", .(gene_name, cluster)])$cluster)
+
+cluster_counts_avg <- counts_w_design[, lapply(.SD, FUN = mean), .SDcols = "norm_counts", by = c("sample", "genotype", "cluster")]
+cluster_counts_avg$genotype <- factor(cluster_counts_avg$genotype, levels = c("F_HET", "F_HOMO", "M_WT", "M_HEMI"))
+cluster_counts_avg$sex <- gsub("_.*", "", cluster_counts_avg$genotype)
+cluster_counts_avg_wide <- dcast(cluster_counts_avg, sample + sex + genotype ~ cluster, value.var = "norm_counts")
+
+ggplot(data = cluster_counts_avg_wide, aes(x = SynTII, y = LaTP)) +
+  geom_point(aes(color = sex, shape = genotype), size = 4)
+
+ggplot(data = cluster_counts_avg_wide, aes(x = SpT, y = JZP1)) +
+  geom_point(aes(color = sex, shape = genotype), size = 4)
+
+ggplot(data = cluster_counts_avg_wide, aes(x = SpT, y = JZP2)) +
+  geom_point(aes(color = sex, shape = genotype), size = 4)
+
+```
+
+Expression of markers from cell types of the labyrinth is more predictive of the genotype than junctional zone's ones. One reason could be the more variable presence of JZ tissue in the single dissected placentae.
+
+# Pseudotime using DEGs expression
+
+```{r pseudotime w DEGs (FIGURE), include = TRUE}
+
+DEGs_counts_avg <- counts_w_design[, lapply(.SD, FUN = mean), .SDcols = "norm_counts", by = c("sample", "genotype", "DE_sign")]
+DEGs_counts_avg_wide <- dcast(DEGs_counts_avg, sample + genotype ~ DE_sign, value.var = "norm_counts")
+DEGs_counts_avg_wide$genotype <- factor(DEGs_counts_avg_wide$genotype, levels = c("F_HET", "F_HOMO", "M_WT", "M_HEMI"))
+DEGs_counts_avg_wide$sex <- gsub("_.*", "", DEGs_counts_avg_wide$genotype)
+
+down_DEGs_nonMarkers_counts_avg <- counts_w_design[cluster %in% c("none") & DE_sign == "DOWN", lapply(.SD, FUN = mean), .SDcols = "norm_counts", by = c("sample", "genotype")]
+up_DEGs_nonMarkers_counts_avg <- counts_w_design[cluster %in% c("none") & DE_sign == "UP", lapply(.SD, FUN = mean), .SDcols = "norm_counts", by = c("sample", "genotype")]
+DEGs_nonMarkers_counts_avg <- merge(down_DEGs_nonMarkers_counts_avg, up_DEGs_nonMarkers_counts_avg, by = c("sample", "genotype"), suffixes = c(".DOWN", ".UP"))
+DEGs_nonMarkers_counts_avg$genotype <- factor(DEGs_nonMarkers_counts_avg$genotype, levels = c("F_HET", "F_HOMO", "M_WT", "M_HEMI"))
+DEGs_nonMarkers_counts_avg$sex <- gsub("_.*", "", DEGs_nonMarkers_counts_avg$genotype)
+
+ggplot(data = DEGs_counts_avg_wide, aes(x = DOWN, y = UP)) +
+  geom_point(aes(color = sex, shape = genotype), size = 4)
+
+```
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```

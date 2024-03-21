@@ -1,0 +1,484 @@
+---
+title: "AID-Ogt blastocysts mRNA-Seq - analysis post RUVSeq"
+date: "February 3, 2022"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide', fig.width=12, fig.height=8)
+
+```
+
+```{r loading needed packages}
+
+library("DESeq2")
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library(ggpubr)
+library(gridExtra)
+library(pheatmap)
+library(ggrepel)
+library(vsn)
+library(RUVSeq)
+
+```
+
+```{r customizing plots DESeq2}
+
+pval_hist <- function (dds_res) {
+  ggplot(as(dds_res, "data.frame"), aes(x = pvalue)) +
+    geom_histogram(binwidth = 0.01, fill = "Royalblue", boundary = 0) +
+    ggtitle(gsub(".*: sex_geno ", "", mcols(dds_res)$description[4])) +
+    scale_x_continuous(breaks=c(0.0, 0.5, 1)) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20),
+          title = element_text(size = 18),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"))
+}
+
+MA_plot_w_labels <- function(my_dds_res, adjpval_to_color, l2fc_to_label, baseMean_to_label, ylims) {
+  # getting comparison name
+  comp_name <- gsub(".*: sex_geno ", "", mcols(my_dds_res)$description[4])
+  # merging with gene map dt to get gene names
+  my_dds_res$gene_id <- rownames(my_dds_res)
+  my_dds_res <- merge(as.data.frame(my_dds_res), geneID2name_w_ex, by = "gene_id", all.x = TRUE)
+  # adding label to genes which are significant and expressed above defined thresholds
+  my_dds_res$to_label <- ""
+  to_label <- which(my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label))
+  my_dds_res$to_label[to_label] <- my_dds_res$gene_name[to_label]
+  # color genes which are significant and expressed above defined thresholds
+  my_dds_res$to_color <- ""
+  my_dds_res$to_color[my_dds_res$padj < adjpval_to_color] <- paste0("adjpval < ", adjpval_to_color)
+  dt_to_plot <- as.data.table(my_dds_res)
+  ggplot(dt_to_plot, aes(x = baseMean, y = log2FoldChange)) +
+    geom_point(aes(color = to_color), alpha = 0.8) +
+    geom_text_repel(aes(label = to_label), size = 5, max.overlaps = 100) +
+    scale_x_log10(limits=c(10, max(my_dds_res$baseMean))) +
+    ylim(ylims) +
+    scale_color_manual(values = c("grey", "blue")) +
+    ggtitle(comp_name) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 20),
+          legend.position = "none",
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+```
+
+```{r DESeq2-normalized counts PCA custom function}
+
+library(ggforce)
+
+# PCA of DESeq2-normalized counts
+plotPCA_data <- function (my_dds, intgroup, mean_threshold, ntop, returnData = TRUE) {
+    # computing row means of DESeq2-normalized counts
+    rM <- rowMeans2(counts(my_dds, normalized = TRUE))
+    # creating object of normTransformed data i.e. log2 transformed DESeq2-normalized data
+    ntd <- normTransform(my_dds)
+    # keeping only genes with rowMean > my threshold
+    f_norm_counts <- assay(ntd)[rM > mean_threshold, ]
+    # computing row vars of log2 transformed DESeq2-normalized counts
+    rv <- rowVars(f_norm_counts)
+    # selecting the first ntop genes based on var computed on line above
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop,length(rv)))]
+    # pca of the selected genes
+    pca <- prcomp(t(f_norm_counts[select, ]))
+    percentVar <- pca$sdev^2/sum(pca$sdev^2)
+    if (!all(intgroup %in% names(colData(my_dds)))) {
+        stop("the argument 'intgroup' should specify columns of colData(dds)")
+    }
+    intgroup.df <- as.data.frame(colData(my_dds)[, intgroup, 
+        drop = FALSE])
+    group <- if (length(intgroup) > 1) {
+        factor(apply(intgroup.df, 1, paste, collapse = ":"))
+    }
+    else {
+        colData(my_dds)[[intgroup]]
+    }
+    d <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], PC3 = pca$x[, 3], PC4 = pca$x[, 4], intgroup.df, name = colnames(my_dds))
+    if (returnData) {
+        attr(d, "percentVar") <- percentVar[1:4]
+        return(d)
+    }
+}
+
+plotPCA <- function (my_dds, intgroup, mean_threshold, ntop, PC_x, PC_y) {
+  pcaData <- plotPCA_data(my_dds = my_dds, intgroup = intgroup, mean_threshold = mean_threshold, ntop = ntop, returnData = TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  par(mfrow=c(2,1))
+  ggplot(pcaData, aes(pcaData[, PC_x], pcaData[, PC_y], color=pcaData[,6], shape=pcaData[,5], label = rownames(pcaData))) +
+    geom_point(size=4) +
+    xlab(paste0("PC",PC_x,": ",percentVar[PC_x],"% variance")) +
+    ylab(paste0("PC",PC_y,": ",percentVar[PC_y],"% variance")) +
+    scale_color_discrete(name = colnames(pcaData)[5]) +
+    scale_shape_discrete(name = colnames(pcaData)[6]) +
+    #geom_text_repel(size = 3) +
+    coord_fixed() +
+    geom_mark_ellipse(aes(fill = as.factor(pcaData[,6])), expand = unit(0.5,"mm")) +
+    theme(axis.text = element_text(size = 22), axis.title = element_text(size = 22),
+        title = element_text(size = 22),
+        legend.text = element_text(size = 22), legend.title = element_text(size = 22),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+}
+
+```
+
+```{r loading necessary Rdata files}
+
+load("Rdata/design_df.Rdata")
+load("Rdata/ses5_AUX.Rdata")
+load("Rdata/ses5_UNT.Rdata")
+load("Rdata/tx2gene_w_ex.Rdata")
+load("Rdata/geneID2name_w_ex.Rdata")
+load("Rdata/gene_map_dt.Rdata")
+load("Rdata/dds_all.Rdata")
+
+```
+
+```{r adj pvalue cutoff}
+
+adjpvalue_cutoff <- 0.05
+
+```
+
+# DESeq
+
+## Design formula without including confounding factors of unwanted variation
+
+```{r DESeq pipeline standard}
+
+DESeq_pipeline_standard <- function (my_counts_table, my_design_df) {
+  # subsetting design df
+  design_df = my_design_df[my_design_df$SAMPLE_NAME %in% colnames(my_counts_table), ]
+  # sample order in counts table needs to be same as in design df
+  my_counts_table <- my_counts_table[, rownames(design_df)]
+  # creating DESeqDataset
+  dds <- DESeqDataSetFromMatrix(countData = my_counts_table,
+                                colData = design_df,
+                                design = ~ sex_geno)
+  # pre-filtering low count genes
+  keep <- rowSums(counts(dds)) >= 10
+  dds <- dds[keep,]
+  # the standard differential expression analysis steps are wrapped into a single function, DESeq
+  dds <- DESeq(dds)
+  # DESeq results for genotype comparison for females and males separately
+  res_list <- list(
+    res_F = lfcShrink(dds, contrast=c("sex_geno","F_AID-Ogt","F_wt"), alpha=adjpvalue_cutoff, type="ashr"),
+    res_M = lfcShrink(dds, contrast=c("sex_geno","M_AID-Ogt","M_wt"), alpha=adjpvalue_cutoff, type="ashr"))
+  names(res_list) <- c("F", "M")
+  return(res_list)
+}
+
+make_standard_dds <- function (my_counts_table, my_design_df) {
+  # subsetting design df
+  design_df = my_design_df[my_design_df$SAMPLE_NAME %in% colnames(my_counts_table), ]
+  rownames(design_df) <- design_df$SAMPLE_NAME
+  my_counts_table <- my_counts_table[, rownames(design_df)]
+  dds <- DESeqDataSetFromMatrix(countData = my_counts_table,
+                                colData = design_df,
+                                design = ~ sex_geno)
+  # pre-filtering low count genes
+  keep <- rowSums(counts(dds)) >= 10
+  dds <- dds[keep,]
+  # the standard differential expression analysis steps are wrapped into a single function, DESeq
+  dds <- DESeq(dds)
+  return(dds)
+}
+
+```
+
+```{r applying DESeq pipeline}
+
+DESeq_standard_res <- lapply(list(UNT = counts(ses5_UNT), AUX = counts(ses5_AUX)), DESeq_pipeline_standard, my_design_df = design_df)
+DESeq_standard_dds <- lapply(list(UNT = counts(ses5_UNT), AUX = counts(ses5_AUX)), make_standard_dds, my_design_df = design_df)
+
+```
+
+### PCA of DESeq2-normalized counts
+
+```{r DESeq2-normalized counts PCA plots (Supplementary Figure S2G), include = TRUE}
+
+plotPCA_figure <- function (my_dds, intgroup, mean_threshold, ntop, PC_x, PC_y, my_title) {
+  pcaData <- plotPCA_data(my_dds = my_dds, intgroup = intgroup, mean_threshold = mean_threshold, ntop = ntop, returnData = TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  par(mfrow=c(2,1))
+  ggplot(pcaData, aes(pcaData[, PC_x], pcaData[, PC_y], color=pcaData[,5])) +
+    geom_point(size=3) +
+    xlab(paste0("PC",PC_x,": ",percentVar[PC_x],"% variance")) +
+    ylab(paste0("PC",PC_y,": ",percentVar[PC_y],"% variance")) +
+    ggtitle(my_title) +
+    scale_color_discrete(name = colnames(pcaData)[5]) +
+    coord_fixed() +
+    geom_mark_ellipse(aes(fill = as.factor(pcaData[,5])), expand = unit(0.5,"mm"), show.legend = FALSE, alpha = 0.1) +
+    theme(axis.text = element_text(size = 22), axis.title = element_text(size = 22),
+        title = element_text(size = 22),
+        legend.text = element_text(size = 22), legend.title = element_text(size = 22),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+}
+
+plotPCA_figure(my_dds = DESeq_standard_dds$UNT, intgroup = c("sex_geno"), mean_threshold = 10, ntop = 1000, PC_x = 1, PC_y = 2, my_title = "UNT")
+plotPCA_figure(my_dds = DESeq_standard_dds$UNT, intgroup = c("sex_geno"), mean_threshold = 10, ntop = 1000, PC_x = 2, PC_y = 3, my_title = "UNT")
+plotPCA_figure(my_dds = DESeq_standard_dds$AUX, intgroup = c("sex_geno"), mean_threshold = 10, ntop = 1000, PC_x = 1, PC_y = 2, my_title = "AUX-treated")
+
+```
+
+### P-value histograms and MA-plots
+
+The threshold used for a dot to be coloured in red in the MA-plots is: p-value adjusted < `r adjpvalue_cutoff`.
+
+#### Untreated blastocysts
+
+```{r pvalue histograms and MA-plots UNT, include = TRUE}
+
+do.call(grid.arrange, lapply(DESeq_standard_res[[1]], pval_hist))
+lapply(DESeq_standard_res[[1]], MA_plot_w_labels, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = 0.2, baseMean_to_label = 20, ylims = c(-1.2,1.2))
+
+```
+
+#### AUX-treated blastocysts
+
+```{r pvalue histograms and MA-plots AUX, include = TRUE}
+
+do.call(grid.arrange, lapply(DESeq_standard_res[[2]], pval_hist))
+lapply(DESeq_standard_res[[2]], MA_plot_w_labels, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = 0.2, baseMean_to_label = 20, ylims = c(-1.2,1.2))
+
+```
+
+## Design formula including factors of unwanted variation computed by RUVg
+
+I use results from RUVg with k=6 for both UNT and AUX-treated blasto.
+
+```{r DESeq pipeline w RUVg}
+
+DESeq_pipeline_w_RUVg_W6 <- function (my_ses, my_design_df) {
+  my_counts_table = counts(my_ses)
+  # removing AID from counts table
+  my_counts_table = my_counts_table[!grepl("AID", rownames(my_counts_table)), ]
+  # subsetting design df
+  design_df = my_design_df[my_design_df$SAMPLE_NAME %in% colnames(my_counts_table), ]
+  # merging design_df with pData from RUVg, which contains the factor of unwanted variation
+  pData(my_ses)$SAMPLE_NAME <- rownames(pData(my_ses))
+  design_df <- merge(design_df, pData(my_ses)[, c("SAMPLE_NAME", grep("W_", colnames(pData(my_ses)), value = TRUE))], by = c("SAMPLE_NAME"), all = FALSE)
+  rownames(design_df) <- design_df$SAMPLE_NAME
+  my_counts_table <- my_counts_table[, rownames(design_df)]
+  # creating DESeqDataset
+  dds <- DESeqDataSetFromMatrix(countData = my_counts_table,
+                                colData = design_df,
+                                design = ~ W_1 + W_2 + W_3 + W_4 + W_5 + W_6 + sex_geno)
+  # pre-filtering low count genes
+  keep <- rowSums(counts(dds)) >= 10
+  dds <- dds[keep,]
+  # the standard differential expression analysis steps are wrapped into a single function, DESeq
+  dds <- DESeq(dds)
+  # DESeq results for genotype comparison for females and males separately
+  res_list <- list(
+    res_F = lfcShrink(dds, contrast=c("sex_geno","F_AID-Ogt","F_wt"), alpha=adjpvalue_cutoff, type="ashr"),
+    res_M = lfcShrink(dds, contrast=c("sex_geno","M_AID-Ogt","M_wt"), alpha=adjpvalue_cutoff, type="ashr"))
+  names(res_list) <- c("F", "M")
+  return(res_list)
+}
+
+dds_w_RUVg_W6 <- function (my_ses, my_design_df) {
+  my_counts_table = normCounts(my_ses)
+  # subsetting design df
+  design_df = my_design_df[my_design_df$SAMPLE_NAME %in% colnames(my_counts_table), ]
+  # merging design_df with pData from RUVg, which contains the factor of unwanted variation
+  pData(my_ses)$SAMPLE_NAME <- rownames(pData(my_ses))
+  design_df <- merge(design_df, pData(my_ses)[, c("SAMPLE_NAME", grep("W_", colnames(pData(my_ses)), value = TRUE))], by = c("SAMPLE_NAME"), all = FALSE)
+  rownames(design_df) <- design_df$SAMPLE_NAME
+  my_counts_table <- my_counts_table[, rownames(design_df)]
+  # creating DESeqDataset
+  dds <- DESeqDataSetFromMatrix(countData = my_counts_table,
+                                colData = design_df,
+                                design = ~ W_1 + W_2 + W_3 + W_4 + W_5 + W_6 + sex_geno)
+  # pre-filtering low count genes
+  keep <- rowSums(counts(dds)) >= 10
+  dds <- dds[keep,]
+  # the standard differential expression analysis steps are wrapped into a single function, DESeq
+  dds <- DESeq(dds)
+  return(dds)
+}
+
+```
+
+```{r applying DESeq pipeline w RUVg}
+
+DESeq_w_RUVg_W6_result <- lapply(list(UNT = ses5_UNT, AUX = ses5_AUX), DESeq_pipeline_w_RUVg_W6, my_design_df = design_df)
+dds_w_RUVg_W6 <- lapply(list(UNT = ses5_UNT, AUX = ses5_AUX), dds_w_RUVg_W6, my_design_df = design_df)
+
+```
+
+### PCA with RUVg-adjusted and DESeq2-normalized counts
+
+```{r DESeq2-normalized counts PCA plots RUVg (FIGURE), include = TRUE}
+
+plotPCA_figure(my_dds = dds_w_RUVg_W6$UNT, intgroup = c("sex_geno"), mean_threshold = 10, ntop = 1000, PC_x = 1, PC_y = 2, my_title = "UNT")
+plotPCA_figure(my_dds = dds_w_RUVg_W6$UNT, intgroup = c("sex_geno"), mean_threshold = 10, ntop = 1000, PC_x = 2, PC_y = 3, my_title = "UNT")
+plotPCA_figure(my_dds = dds_w_RUVg_W6$AUX, intgroup = c("sex_geno"), mean_threshold = 10, ntop = 1000, PC_x = 1, PC_y = 2, my_title = "AUX-treated")
+
+```
+
+The separation between genotypes appears only for AUX-treated males on PC2!
+
+### P-value histograms and MA-plots
+
+The threshold used for a dot to be colored in red in the MA-plots is: p-value adjusted < `r adjpvalue_cutoff`.
+
+#### Untreated blastocysts, using k=6 in RUVg
+
+```{r pvalue histograms and MA-plots UNT w RUVg 6 (Supplementary Figure S2H upper part), include = TRUE}
+
+do.call(grid.arrange, lapply(DESeq_w_RUVg_W6_result[[1]], pval_hist))
+lapply(DESeq_w_RUVg_W6_result[[1]], MA_plot_w_labels, adjpval = adjpvalue_cutoff, ylims = c(-1.2,1.2), l2fc_to_label = 0.2, baseMean_to_label = 20)
+
+```
+
+#### AUX-treated blastocysts, using k=6 in RUVg
+
+```{r pvalue histograms and MA-plots AUX w RUVg 6 (Supplementary Figure S2H lower part), include = TRUE}
+
+do.call(grid.arrange, lapply(DESeq_w_RUVg_W6_result[[2]], pval_hist))
+lapply(DESeq_w_RUVg_W6_result[[2]], MA_plot_w_labels, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = 0.2, baseMean_to_label = 20, ylims = c(-1.2,1.2))
+
+```
+
+### Number of DEGs
+
+up
+```{r num DEGs up, results='asis'}
+
+up <- lapply(list(UNT_F = DESeq_w_RUVg_W6_result[[1]][[1]], UNT_M = DESeq_w_RUVg_W6_result[[1]][[2]], AUX_F = DESeq_w_RUVg_W6_result[[2]][[1]], AUX_M = DESeq_w_RUVg_W6_result[[2]][[2]]), FUN = function(res){sum(!(is.na(res$padj)) & res$padj < adjpvalue_cutoff & res$log2FoldChange > 0)})
+up 
+
+```
+
+up baseMean > 10
+```{r num DEGs up f, results='asis'}
+
+up <- lapply(list(UNT_F = DESeq_w_RUVg_W6_result[[1]][[1]], UNT_M = DESeq_w_RUVg_W6_result[[1]][[2]], AUX_F = DESeq_w_RUVg_W6_result[[2]][[1]], AUX_M = DESeq_w_RUVg_W6_result[[2]][[2]]), FUN = function(res){sum(!(is.na(res$padj)) & res$padj < adjpvalue_cutoff & res$log2FoldChange > 0 & res$baseMean > 10)})
+up 
+
+```
+
+down
+```{r num DEGs down, results='asis'}
+
+down <- lapply(list(UNT_F = DESeq_w_RUVg_W6_result[[1]][[1]], UNT_M = DESeq_w_RUVg_W6_result[[1]][[2]], AUX_F = DESeq_w_RUVg_W6_result[[2]][[1]], DESeq_w_RUVg_W6_result[[2]][[2]]), FUN = function(res){sum(!(is.na(res$padj)) & res$padj < adjpvalue_cutoff & res$log2FoldChange < 0)})
+down 
+
+```
+
+down baseMean > 10
+```{r num DEGs down f, results='asis'}
+
+down <- lapply(list(UNT_F = DESeq_w_RUVg_W6_result[[1]][[1]], UNT_M = DESeq_w_RUVg_W6_result[[1]][[2]], AUX_F = DESeq_w_RUVg_W6_result[[2]][[1]], AUX_M = DESeq_w_RUVg_W6_result[[2]][[2]]), FUN = function(res){sum(!(is.na(res$padj)) & res$padj < adjpvalue_cutoff & res$log2FoldChange < 0 & res$baseMean > 10)})
+down 
+
+```
+
+```{r function to rank DE genes}
+
+# Function which takes a DESeq results object and return it as a dataframe, with genes ordered by pvalue and with gene names added; furthermore it writes this dataframe to a file if desired
+pvalue_ranked_DE <- function (my_res, my_DE_dir, writeToFile, my_adjpval, my_gene_name_mapping_table) {
+  # getting name of contrast
+  contrast_name <- gsub(" ", "_", gsub(".*sex_geno ", "", my_res@elementMetadata$description[4]))
+  # removing genes for which padj is NA
+  my_res <- my_res[!(is.na(my_res$padj)), ]
+  # merging the dataframe with the gene names
+  my_res$gene_id <- row.names(my_res)
+  my_res <- merge(as.data.frame(my_res), my_gene_name_mapping_table, by = "gene_id", all.x = TRUE)
+  # ordering by pvalue
+  my_res_ord <- my_res[order(my_res$pvalue),]
+  # keeping only the ones with padj below desired threshold
+  my_res_ord_f <- my_res_ord[my_res_ord$padj < my_adjpval, ]
+  # writing them to file
+  if (writeToFile) {
+    # creating output directory if it does not exist
+    system(paste0("[ -d ", my_DE_dir, " ] || mkdir -p ", my_DE_dir))
+    write.csv(my_res_ord_f, file=paste0(my_DE_dir, contrast_name, "_DEG_by_pvalue.csv"))
+  }
+  return(my_res_ord_f)
+}
+
+```
+
+```{r DE dir}
+
+# Defining general export directory
+DE_dir <- "../../analysis/DESeq/"
+
+```
+
+```{r ordering an exporting DE genes}
+
+DE_list_RUVg_W6_UNT <- lapply(DESeq_w_RUVg_W6_result[[1]], pvalue_ranked_DE, my_DE_dir = paste0(DE_dir, "RUVg/UNT/W6/"), writeToFile = TRUE, my_adjpval = adjpvalue_cutoff, my_gene_name_mapping_table = geneID2name_w_ex)
+DE_list_RUVg_W6_AUX <- lapply(DESeq_w_RUVg_W6_result[[2]], pvalue_ranked_DE, my_DE_dir = paste0(DE_dir, "RUVg/AUX/W6/"), writeToFile = TRUE, my_adjpval = adjpvalue_cutoff, my_gene_name_mapping_table = geneID2name_w_ex)
+
+```
+
+## Plotting counts DE genes as sanity check
+
+```{r DESeq all samples}
+
+# Running DESeq function in order to make DESeq2-normalized gene counts available
+dds <- DESeq(dds)
+  
+```
+
+I plot the DEGs found using RUVg (with k=6) in design formula for Male samples treated with AUX.
+
+```{r plot gene counts, include = TRUE, fig.height=12, fig.width=16}
+
+my_plotCounts <- function (g, my_GOIs) {
+  if (sum(grepl(my_GOIs[g], dds@rowRanges@partitioning@NAMES)) > 0) {
+      d <- plotCounts(dds, gene = my_GOIs[g], intgroup = c("sex_geno", "CONDITION", "group"), returnData = TRUE)
+    ggplot(d, aes(x = group, y = count, colour = CONDITION)) + 
+      geom_point(position=position_jitter(w=0.1,h=0), size = 4) + 
+      scale_y_log10(limits = ) +
+      ggtitle(names(my_GOIs)[g]) +
+      theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19, angle = 60, vjust = 0.5, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+  }
+}
+
+DE_genes <- setNames(DE_list_RUVg_W6_AUX$M$gene_id[DE_list_RUVg_W6_AUX$M$baseMean > 10], nm = DE_list_RUVg_W6_AUX$M$gene_name[DE_list_RUVg_W6_AUX$M$baseMean > 10])
+do.call("ggarrange", args = list(plotlist = lapply(1:6, my_plotCounts, my_GOIs = DE_genes), common.legend = TRUE, legend = "right"))
+do.call("ggarrange", args = list(plotlist = lapply(7:12, my_plotCounts, my_GOIs = DE_genes), common.legend = TRUE, legend = "right"))
+
+```
+
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```
+

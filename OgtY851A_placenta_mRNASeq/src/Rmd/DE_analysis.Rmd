@@ -1,0 +1,421 @@
+---
+title: "Differential gene expression analysis in E12.5 placentae from OgtY841A-het females x OgtY841A-hemi males"
+date: "June 25, 2022"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide', fig.width=12, fig.height=8)
+
+```
+
+```{r loading needed packages}
+
+library("DESeq2")
+library("tximport")
+library(ggplot2)
+library("ggrepel")
+library(reshape2)
+library("vsn")
+library("pheatmap")
+library(ggpubr)
+library(gplots)
+library(gridExtra)
+library(data.table)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+
+```
+
+```{r function to retrieve gene names res DESeq2}
+
+retrieve_res_names <- function (r) {
+  res_df <- data.frame(gene_id = rownames(r))
+  res_df <- merge(res_df, unique(gene_map_dt[, .(gene_name, gene_id)]), all.x = TRUE, by = "gene_id")
+  res_df$gene_name[is.na(res_df$gene_name)] <- res_df$gene_id[is.na(res_df$gene_name)]
+  return(res_df)
+}
+
+```
+
+```{r customizing plots DESeq2}
+
+# Changes are storage of 4 PCs (instead of only 2) in the pcaData object and removal of ggplot part (just to avoid redundancy because I will anyway customize the plotting in the function in chunck 'clustering samples') 
+plotPCA_data <- function (object, intgroup = "condition", ntop = 500, returnData = TRUE) {
+    rv <- rowVars(assay(object))
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop,length(rv)))]
+    pca <- prcomp(t(assay(object)[select, ]))
+    percentVar <- pca$sdev^2/sum(pca$sdev^2)
+    if (!all(intgroup %in% names(colData(object)))) {
+        stop("the argument 'intgroup' should specify columns of colData(dds)")
+    }
+    intgroup.df <- as.data.frame(colData(object)[, intgroup, 
+        drop = FALSE])
+    group <- if (length(intgroup) > 1) {
+        factor(apply(intgroup.df, 1, paste, collapse = ":"))
+    }
+    else {
+        colData(object)[[intgroup]]
+    }
+    d <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], PC3 = pca$x[, 3], PC4 = pca$x[, 4], group = group, 
+        intgroup.df, name = colnames(object))
+    if (returnData) {
+        attr(d, "percentVar") <- percentVar[1:4]
+        return(d)
+    }
+}
+
+pval_hist <- function (dds_res) {
+  ggplot(as(dds_res, "data.frame"), aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.01, fill = "Royalblue", boundary = 0) +
+  ggtitle(gsub(" vs ", "\nvs ", gsub("(.*genotype )|(.*: )", "", mcols(dds_res)$description[4]))) +
+  scale_x_continuous(breaks=c(0.0, 0.5, 1)) +
+  theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20),
+        title = element_text(size = 18),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        legend.key.height = unit(1.5,"line"))
+}
+
+custom_MA_plot <- function(my_dds_res, adjpval_to_color, l2fc_to_label, baseMean_to_label, ylim) {
+  # adding label to genes which are significant and expressed above defined thresholds - labels are gene names
+  my_res_names_df <- retrieve_res_names(my_dds_res)
+  my_dds_res$to_label <- ""
+  my_dds_res$to_label[!is.na(my_dds_res$padj) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label)] <- my_res_names_df$gene_name[!is.na(my_dds_res$padj) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label)]
+  # adding label to genes which are significant and expressed above defined thresholds
+  my_dds_res$to_color <- ""
+  my_dds_res$to_color[my_dds_res$padj < adjpval_to_color] <- paste0("adjpval < ", adjpval_to_color)
+  dt_to_plot <- as.data.table(my_dds_res)
+  ggplot(dt_to_plot, aes(x = baseMean, y = log2FoldChange)) +
+    geom_point(aes(color = to_color), alpha = 0.8) +
+    geom_text_repel(aes(label = to_label), size = 3, max.overlaps = 40) +
+    scale_x_log10() +
+    ylim(ylim) +
+    scale_color_manual(values = c("grey", "blue")) +
+    ggtitle(gsub(".*: genotype ", "", mcols(my_dds_res)$description[4])) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 20),
+          legend.position = "none",
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+```
+
+```{r function to rank DE genes}
+
+# Function which takes a DESeq results object and return it as a dataframe, with genes ordered by pvalue, filtered by adjusted pvalue and with gene names added; furthermore it writes this dataframe to a file if desired
+pvalue_ranked_DE <- function (my_res, my_DE_dir, writeToFile, my_adjpval, my_gene_name_mapping_table, my_baseMean_cutoff) {
+  # getting name of contrast
+  contrast_name <- gsub(" ", "_", gsub("(.*genotype )|(.*: )", "", mcols(my_res)$description[4]))
+  # removing genes for which padj is NA
+  my_res <- my_res[!(is.na(my_res$padj)), ]
+  # merging the dataframe with the gene names
+  my_res$gene_id <- row.names(my_res)
+  my_res <- merge(as.data.frame(my_res), my_gene_name_mapping_table, by = "gene_id", all.x = TRUE)
+  # ordering by pvalue
+  my_res_ord <- my_res[order(my_res$pvalue),]
+  # keeping only the ones with padj below desired threshold
+  my_res_ord_f <- my_res_ord[my_res_ord$padj < my_adjpval & my_res_ord$baseMean > my_baseMean_cutoff, ]
+  # writing them to file
+  if (writeToFile) {
+    # creating output directory if it does not exist
+    system(paste0("[ -d ", my_DE_dir, " ] || mkdir -p ", my_DE_dir))
+    write.csv(my_res_ord_f, file=paste0(my_DE_dir, contrast_name, "_DEG_by_pvalue.csv"))
+  }
+  return(my_res_ord_f)
+}
+
+```
+
+```{r DE dir}
+
+# Defining export directory
+DE_dir <- "../../analysis/DESeq/"
+
+```
+
+```{r adj pvalue cutoff and log2FC threshold}
+
+adjpvalue_cutoff <- 0.05
+log2FC_threshold <- 0.2
+
+```
+
+# Design of the experiment
+
+1. E12.5 placentae were dissected from 3 litters coming from crosses of a mother OgtY841A-het x OgtY841A-homo male.
+2. The head of the embryo was used to assign it to the 4 possible genotypes coming from this cross.
+3. Among the 4 genotypes, the het females represent the control for females, the wt males represent the control for males.
+4. 6 placentae for each genotype were sequenced, trying to have the 6 biological replicates coming from at least 2 different litters.
+
+```{r creating tx2gene and geneID2name df}
+
+# Creating the transcriptID2geneID df; the transcriptID2geneID tsv file has been created with custom shell script tx2gene_from_encode_gtf.sh in src/sh folder
+tx2gene <- fread("../../data/annotations/gencode.vM25.annotation.tx2gene.tsv", col.names = c("tx_id", "gene_id"))
+# removing version
+tx2gene <- tx2gene[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(tx2gene)]
+
+# Creating the geneID2geneName df; the geneID2geneName tsv file has been created with custom shell script geneID2name_from_encode_gtf.sh in src/sh folder
+geneID2name <- fread("../../data/annotations/gencode.vM25.annotation.geneID2name.tsv", col.names = c("gene_id", "gene_name"))
+# removing version
+geneID2name <- geneID2name[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(geneID2name)]
+
+# Merging the 2 dfs
+gene_map_dt <- as.data.table(merge(geneID2name, tx2gene, by = "gene_id"))
+
+```
+
+```{r file path}
+
+# specifying the directory containing Salmon outputs
+dir <- "../../data/sequencing/Salmon"
+
+files <- list.files(path = dir)
+
+# making the character vector of names of Salmon quantification's files
+files_w_path <- file.path(dir, files)
+
+```
+
+```{r reading sample metadata}
+
+# reading table containing sample names and day of collection
+samples_table <- fread("../../data/sequencing/samples_table.csv")
+design_df <- as.data.frame(samples_table)
+# Specifying litter as a discrete variable
+design_df$group_or_time_point <- as.character(design_df$group_or_time_point)
+# condition is the genotype, group_or_time_point is the litter
+names(design_df)[3:4] <- c("genotype", "litter")
+# reordering design df based on genotype
+design_df <- design_df[order(design_df$genotype), ]
+rownames(design_df) <- design_df$sample # necessary to make dds
+# ordering files based on order of samples in design df
+samples_in_files <- gsub("HG2KNBGXL_", "", gsub("_22s00.*", "", files))
+files_w_path <- files_w_path[match(design_df$sample, samples_in_files)]
+# adding sex variable to design df
+design_df$sex <- gsub("_.*", "", design_df$genotype)
+
+```
+
+```{r design table, results='asis'}
+
+knitr::kable(design_df, row.names = FALSE)
+
+```
+
+# Clustering
+
+```{r creating the DESeqDataSet}
+
+# Creating tximport object
+txi <- tximport(files_w_path, type="salmon", tx2gene=tx2gene, ignoreTxVersion = TRUE)
+
+# renaming columns of txi matrices object as the sample names
+colnames(txi$counts) <- design_df$sample
+colnames(txi$abundance) <- design_df$sample
+colnames(txi$length) <- design_df$sample
+
+# Creating DESeqDataSet
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                    colData = design_df,
+                                    design = ~ genotype)
+
+```
+
+```{r prefiltering}
+
+keep <- rowSums(counts(ddsTxi)) >= 10
+ddsTxi <- ddsTxi[keep,]
+
+```
+
+```{r DESeq function}
+
+# the standard differential expression analysis steps are wrapped into a single function, DESeq
+ddsTxi <- DESeq(ddsTxi)
+
+```
+
+## Heatmap for quality assessment
+
+After applying, in order, log2(norm counts + 1), rlog and Variance Stabilizing Transformation, I plot heatmaps for top highly expressed genes to check for eventual big sample heterogeneity present in the dataset. 
+
+```{r pheatmap after different transformations, include = TRUE}
+
+highest_expr_hm <- function (my_dds, my_transformation) {
+  select <- order(rowMeans(counts(my_dds, normalized = FALSE)), decreasing = TRUE)[1:30]
+  design_df_h <- as.data.frame(colData(my_dds)[,c("genotype", "litter")])
+  if (my_transformation == "log2") {
+    dds_t <- normTransform(my_dds)
+  } else if (my_transformation == "rlog") {
+    dds_t <- rlog(my_dds, blind = TRUE)
+  } else if (my_transformation == "vst") {
+    dds_t <- vst(my_dds, blind = TRUE)
+  }
+  pheatmap(assay(dds_t)[select,], cluster_rows = FALSE, show_rownames = TRUE, show_colnames = TRUE, cluster_cols = TRUE, annotation_col = design_df_h, main = paste0(my_transformation, " transformation"))
+}
+
+highest_expr_hm(my_dds = ddsTxi, my_transformation = "log2")
+highest_expr_hm(my_dds = ddsTxi, my_transformation = "rlog")
+highest_expr_hm(my_dds = ddsTxi, my_transformation = "vst")
+
+```
+
+* Sample P1 has a problem, I will remove it from the dataset. 
+* rlog transformation is not appropriate with this dataset.
+
+```{r removing bad sample}
+
+rm(ddsTxi)
+
+# removing from counts table and design df
+design_df <- design_df[!(rownames(design_df) %in% c("P1")), ]
+txi$abundance <- txi$abundance[, -1]
+txi$counts <- txi$counts[, -1]
+txi$length <- txi$length[, -1]
+colnames(txi$counts) <- design_df$sample
+colnames(txi$abundance) <- design_df$sample
+colnames(txi$length) <- design_df$sample
+
+# rebuilding dds
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                    colData = design_df,
+                                    design = ~ sex)
+keep <- rowSums(counts(ddsTxi)) >= 10
+ddsTxi <- ddsTxi[keep,]
+ddsTxi <- DESeq(ddsTxi)
+
+```
+
+## PCA
+
+```{r data transformation}
+
+ntd <- normTransform(ddsTxi)
+vsd <- vst(ddsTxi, blind = TRUE)
+
+```
+
+```{r PCA, include = TRUE}
+
+custom_DESeq2_PCA <- function (my_transformed_data, PC_x, PC_y, my_transformation) {
+  pcaData <- plotPCA_data(my_transformed_data, intgroup=c("genotype", "litter"), returnData=TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  ggplot(pcaData, aes(pcaData[, PC_x], pcaData[, PC_y], color=genotype, shape=litter, label = rownames(pcaData))) +
+    geom_point(size = 2) +
+    geom_text_repel(size = 4) +
+    xlab(paste0("PC",PC_x,": ",percentVar[PC_x],"% variance")) +
+    ylab(paste0("PC",PC_y,": ",percentVar[PC_y],"% variance")) +
+    coord_fixed() +
+    ggtitle(paste0(my_transformation, " transformation")) +
+    theme(axis.text = element_text(size = 22), axis.title = element_text(size = 22),
+          title = element_text(size = 20),
+          legend.text = element_text(size = 22), legend.title = element_text(size = 22),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"))
+}
+
+custom_DESeq2_PCA(ntd, PC_x = 1, PC_y = 2, my_transformation = "log2")
+custom_DESeq2_PCA(ntd, PC_x = 2, PC_y = 3, my_transformation = "log2")
+
+custom_DESeq2_PCA(vsd, PC_x = 1, PC_y = 2, my_transformation = "vst")
+custom_DESeq2_PCA(vsd, PC_x = 2, PC_y = 3, my_transformation = "vst")
+
+```
+
+Clustering based on genotype does not appear in the PCA. log2 transformation makes the sex clustering more evident.
+
+# Differential Expression Analysis - all Female vs all Male samples
+
+```{r DESeq results list sex}
+
+res_sex <- lfcShrink(ddsTxi, contrast=c("sex","F","M"), alpha=adjpvalue_cutoff, type="ashr")
+
+```
+
+The threshold used for a dot to be colored in red in the MA-plots is: p-value adjusted < `r adjpvalue_cutoff`, to be labeled is color,  baseMean > 10 and log2FC > `r log2FC_threshold`.
+
+<n> Two plots with two different y-ranges are necessary for a complete picture.
+
+```{r pvalue histograms and MA-plots sex (FIGURE), include = TRUE}
+
+baseMean_cutoff_to_label <- 10
+
+pval_hist(res_sex)
+custom_MA_plot(res_sex, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = log2FC_threshold, baseMean_to_label = baseMean_cutoff_to_label, ylim = c(-3,3))
+custom_MA_plot(res_sex, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = log2FC_threshold, baseMean_to_label = baseMean_cutoff_to_label, ylim = c(-11,11))
+
+```
+
+# Differential Expression Analysis - genotypes comparison
+
+```{r rebuilding dds}
+
+rm(ddsTxi)
+
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                    colData = design_df,
+                                    design = ~ genotype)
+keep <- rowSums(counts(ddsTxi)) >= 10
+ddsTxi <- ddsTxi[keep,]
+ddsTxi <- DESeq(ddsTxi)
+
+```
+
+```{r DESeq results list}
+
+res_list <- list(
+res_F = lfcShrink(ddsTxi, contrast=c("genotype","F_HOMO","F_HET"), alpha=adjpvalue_cutoff, type="ashr"),
+res_M = lfcShrink(ddsTxi, contrast=c("genotype","M_HEMI","M_WT"), alpha=adjpvalue_cutoff, type="ashr")
+)
+
+```
+
+The threshold used for a dot to be colored in red in the MA-plots is: p-value adjusted < `r adjpvalue_cutoff`, to be labeled is color,  baseMean > 10 and log2FC > `r log2FC_threshold`.
+
+```{r MA-plots (FIGURE), include = TRUE}
+
+baseMean_cutoff_to_label <- 10
+
+do.call(grid.arrange, lapply(res_list, pval_hist))
+lapply(res_list, custom_MA_plot, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = log2FC_threshold, baseMean_to_label = 10, ylim = c(-3,3))
+
+```
+
+```{r ordering and exporting DE genes}
+
+pvalue_ranked_DE_list <- lapply(res_list, pvalue_ranked_DE, my_DE_dir = DE_dir, writeToFile = TRUE, my_adjpval = adjpvalue_cutoff, my_baseMean_cutoff = 10, my_gene_name_mapping_table = geneID2name)
+
+```
+
+```{r saving Rdata}
+
+save(res_list, file = "Rdata/res_list.Rdata")
+save(gene_map_dt, file = "Rdata/gene_map_dt.Rdata")
+save(ddsTxi, file = "Rdata/ddsTxi.Rdata")
+save(design_df, file = "Rdata/design_df.Rdata")
+
+```
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```

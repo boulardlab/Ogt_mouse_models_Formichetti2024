@@ -1,0 +1,572 @@
+---
+title: "Transposable elements (TEs) analysis in blastocysts from wt M PWD x F FVB OgtT931A-het or OgtT931del-het/wt"
+date: "7th February, 2024"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide')
+
+```
+
+```{r loading needed packages}
+
+library(ggplot2)
+library(data.table)
+library(pheatmap)
+library(DESeq2)
+library(gridExtra)
+library(ggrepel)
+library(ggpubr)
+library(RColorBrewer)
+
+```
+
+# Reading the data
+
+```{r load featureCounts output tables}
+
+# specifying the directory containing featureCounts outputs
+dir <- "../../data/sequencing/featureCounts/STAR_TE"
+
+# getting file names of featureCounts output count tables, sorted alphabetically
+files <- sort(list.files(path = dir)[grep("counts.txt$", list.files(path = dir))])
+
+# character vector of names of files with path
+files_w_path <- file.path(dir, files)
+
+# reading the count tables: first line is a commented line containing featureCounts command and needs to be skipped; columns chr,start,end,strand are dropped because they contain the comma-separated list of chr,start,end,strand for all occurrences of the TE with that unique repName in the annotation - in case of single copy genes these columns usually contain one value, in this case a list of them because each element is repeated in the genome.
+counts_list <- lapply(files_w_path, function (f) {fread(f, skip = 1, drop = c("Chr", "Start",	"End", "Strand"))})
+# all counts tables have the same dimensions because featureCounts counts for all meta-features (and puts 0 in case there are 0 count for that feature in that sample), therefore there will be no NAs in the reduced dt
+counts_dt <- Reduce(function(...) merge(..., by = c("Geneid", "Length"), all = TRUE), counts_list)
+# remove path from sample names
+names(counts_dt) <- sub(".*/", "", sub("_amgm350.*", "", names(counts_dt)))
+names(counts_dt)[1] <- "repName"
+
+rm(counts_list)
+
+```
+
+```{r merging with TE annotation}
+
+# loading TE annotation
+TE_annotation_bed <- "../../data/annotations/RepeatMasker_RepeatLibrary20140131_mm10.noGenes.noSimple.bed"
+TE_anno <- fread(TE_annotation_bed, fill = TRUE, col.names = c("seqnames", "start", "end", "repName", "strand", "repFamClass"), drop = 5)
+# adding +1 to start is necessary for compatibility with methylBase-derived objects because bed file coordinates are 0-based
+TE_anno$start <- TE_anno$start + 1
+# making column with repFamilies only and column with repClasses only
+TE_anno$repFamily <- gsub(".*/", "", TE_anno$repFamClass)
+TE_anno$repClass <- gsub("/.*", "", TE_anno$repFamClass)
+# merging the count table with TE annotation to get repFamilies and Classes
+counts_dt <- merge(counts_dt, unique(TE_anno[,c("repName", "repClass", "repFamily", "repFamClass")]), by = "repName", all.x = TRUE, all.y = FALSE)
+# removing rows whose repFamClass is NA
+counts_dt <- counts_dt[!is.na(counts_dt$repFamClass)]
+
+```
+
+The input files are:
+
+* the output tables made by featureCounts (run in rule 'count_on_TE' of the Snakefile), which contain read counts of all repetitive elements (i.e. all repNames) for all samples
+* the repetitive elements annotation `r TE_annotation_bed` (converted to SAF format in rule of Snakefile) used for featureCounts command, that is used to retrieve repFamily and repClass for each repName. The annotation I chose is the most updated library to Nov2020 of rmsk, from which I removed 'Simple repeats' and 'Low complexity regions'
+* a table with total number of reads per sample in raw fastq files 
+* the samples' table, containing infos on experimental design:
+
+```{r samples table}
+
+# loading samples table
+samples_table <- fread("../../data/sequencing/samples_table.csv")
+# removing M unknown sample
+samples_table <- samples_table[samples_table$condition != "M_U", ]
+# creating 'group' factor as combination of embryo genotype and mother genotype
+samples_table$group <- paste0(samples_table$condition, ".", samples_table$group_or_time_point)
+# extracting sex factor
+samples_table$sex <- gsub("_.*", "", samples_table$condition)
+# releveling genotype and reorder the table for better visualization and plotting
+samples_table$condition <- factor(samples_table$condition, levels = c("F_U", "F_wt", "F_del", "F_T931A", "M_wt", "M_del", "M_T931A"))
+setkey(samples_table, condition)
+# ordering counts dt based on samples table
+setcolorder(counts_dt, c("repName", "repClass", "repFamily", "repFamClass", samples_table$sample))
+
+```
+
+# Analysis at family level 
+
+## FPKM for each family of Repetitive Elements
+
+For each family of Repetitive Elements (in case of elements with no repFamily name or repFamilies belonging to more than one repClass I use repClass) I compute **FPKM** values, as follows: for each sample:
+
+* I compute the sum of counts for all elements belonging to that repFamily
+* I divide this sum by the total number of reads sequenced for that sample and multiply by 10⁶
+* I divide this number by the total sum of lengths (in Kb) of the elements belonging to that repFamily --> FPKM
+* **I subtract from each FPKM the total FPKM of all transposons belonging to the DNA repClass**
+
+```{r load library size table}
+
+# loading table containing total number of STAR input reads per sample
+library_size_dt <- fread("../../data/sequencing/stats/STAR_TE/STAR_input_reads.txt")
+library_size_dt$sample <- gsub(".*/", "", gsub("_amgm350.*", "", library_size_dt$V1))
+library_size_dt$STAR_input <- library_size_dt$V2
+library_size_dt <- library_size_dt[, .(sample, STAR_input)]
+# since I counted fragments in featureCounts, I divide the STAR input reads by 2 to get a rough estimation of read pairs
+library_size_dt$library_size <- library_size_dt$STAR_input/2
+# selecting samples in sample table
+library_size_dt <- library_size_dt[library_size_dt$sample %in% samples_table$sample, ]
+# ordering library size as samples and counts table
+library_size_dt <- library_size_dt[match(samples_table$sample, library_size_dt$sample)]
+
+```
+
+```{r family FPKM}
+
+# I notice that some elements do not have a repFamily but they have a repClass and that some repFamilies are assigned to more than one repClass, therefore I use 'repFamClass' to compute the FPKM 
+# selecting columns on which to compute the sum by 'repFamClass'
+cols <- c("Length", names(counts_dt)[names(counts_dt) %in% samples_table$sample])
+# sum by 'repFamClass'
+family_counts_dt <- counts_dt[, lapply(.SD, sum), by = .(repFamClass), .SDcols = cols] 
+# remove rows containing only 0
+family_counts_dt <- family_counts_dt[rowSums(family_counts_dt[, cols[2:length(cols)], with = FALSE]) > 0, ]
+# divide each column by library size and multiply by 10^6
+family_FPKM_dt <- sweep(family_counts_dt[, cols[2:length(cols)], with = FALSE], 2, library_size_dt$library_size/1000000, FUN = '/')
+# divide each row by repFamClass total length
+family_FPKM_dt <- as.data.table(sweep(family_FPKM_dt, 1, family_counts_dt$Length/1000, FUN = '/'))
+family_FPKM_dt$repFamClass <- family_counts_dt$repFamClass
+# subtract DNA transposons' FPKM from each other family's FPKM value
+DNA_TE_FPKM <- setNames(as.numeric(colSums(family_FPKM_dt[grep("DNA/", family_FPKM_dt$repFamClass), 1:(ncol(family_FPKM_dt)-1)])), cols[2:length(cols)])
+family_FPKM_minusDNA_dt <- as.data.table(sweep(family_FPKM_dt[, 1:(ncol(family_FPKM_dt)-1)], 2, DNA_TE_FPKM, FUN = "-"))
+
+# add back columns with repFamilies and repClasses
+family_FPKM_dt$repFamily <- gsub(".*/", "", family_FPKM_dt$repFamClass)
+family_FPKM_dt$repClass <- gsub("/.*", "", family_FPKM_dt$repFamClass)
+family_FPKM_minusDNA_dt$repFamClass <- family_FPKM_dt$repFamClass
+family_FPKM_minusDNA_dt$repFamily <- family_FPKM_dt$repFamily
+family_FPKM_minusDNA_dt$repClass <- family_FPKM_dt$repClass
+
+```
+
+## Heatmaps
+
+The heatmaps are scaled by rows.
+
+```{r heatmap function}
+
+# Custom function for heatmap of repetitive elements from data.table of FPKM
+all_samples_TE_heatmap <- function (my_measures_table, my_samples_table, sample_cluster, elements_cluster, my_title) {
+  # making df with only the numeric values
+  pheat_df <- as.data.frame(my_measures_table)[, colnames(my_measures_table) %in% my_samples_table$sample]
+  # rownames appearing on heatmap will be the repFamily names (which are actually the repClass when there is no repFamily assigned to an element)
+  repFamilies <- gsub(".*/", "", my_measures_table$repFamClass)
+  # in cases when one repFamily name is associated to more than one repClass, duplicates are created in repFamilies vector. Using repFamClass in these cases
+  ambigous_rows <- which(duplicated(repFamilies) | duplicated(repFamilies, fromLast=TRUE))
+  repFamilies[ambigous_rows] <- my_measures_table$repFamClass[ambigous_rows]
+  rownames(pheat_df) <- repFamilies
+  # ordering samples for better visualization in case no sample clustering is required
+  setkey(my_samples_table, condition)
+  pheat_df <- pheat_df[, my_samples_table$sample]
+  # annotating samples with metadata
+  pheat_anno_samples <- data.frame(condition = my_samples_table$condition, row.names = my_samples_table$sample)
+  # annotating elements with repClasses
+  pheat_anno_elem <- data.frame(repClass = my_measures_table$repClass, repFamilies, row.names = rownames(pheat_df))
+  # ordering TE for better visualization in case no elements clustering is required
+  pheat_df <- pheat_df[order(pheat_anno_elem$repClass), ]
+  pheat_anno_elem <- pheat_anno_elem[rownames(pheat_df), ]
+  pheat_anno_elem$repFamilies <- NULL
+  # removing rows and columns having only 0s
+  pheat_df <- pheat_df[rowSums(pheat_df) != 0, colSums(pheat_df) != 0]
+  # plotting heatmap
+  pheatmap(pheat_df, cluster_rows = elements_cluster, cluster_cols = sample_cluster, annotation_col = pheat_anno_samples, annotation_row = pheat_anno_elem, show_rownames = TRUE, clustering_distance_rows = "correlation", clustering_distance_cols = "correlation", fontsize = 12, scale = "row", main = my_title)
+}
+
+```
+
+```{r heatmap TE families, include = TRUE, fig.height=12, fig.width=15}
+
+all_samples_TE_heatmap(my_measures_table = family_FPKM_dt[!grepl("DNA|rRNA|\\?|scRNA|Other|snRNA|tRNA|Unknown|srpRNA|RC|^RNA|Satellite", family_FPKM_dt$repFamClass)], my_samples_table = samples_table, sample_cluster = FALSE, elements_cluster = FALSE, my_title = "RNA TE FPKM,\n not corrected for DNA traspososons")
+all_samples_TE_heatmap(my_measures_table = family_FPKM_dt[grepl("rRNA|DNA|RC|Satellite", family_FPKM_dt$repFamClass)], my_samples_table = samples_table, sample_cluster = FALSE, elements_cluster = FALSE, my_title = "Contaminants FPKM,\n not corrected for DNA traspososons")
+all_samples_TE_heatmap(my_measures_table = family_FPKM_minusDNA_dt[!grepl("DNA|rRNA|\\?|scRNA|Other|snRNA|tRNA|Unknown|srpRNA|RC|^RNA|Satellite", family_FPKM_minusDNA_dt$repFamClass)], my_samples_table = samples_table, sample_cluster = FALSE, elements_cluster = FALSE, my_title = "RNA TE FPKM,\n corrected for DNA traspososons")
+all_samples_TE_heatmap(my_measures_table = family_FPKM_minusDNA_dt[grepl("rRNA|DNA|RC|Satellite", family_FPKM_minusDNA_dt$repFamClass)], my_samples_table = samples_table, sample_cluster = FALSE, elements_cluster = FALSE, my_title = "Contaminants FPKM,\n corrected for DNA traspososons")
+
+```
+
+* I remove sample het_4D, wt_9F, het_5A, het_3B from the next heatmaps and from the DESeq analysis below because more contaminated with DNA.
+* I use the values not corrected for DNA transposons because - with these single low-input single-embryo samples - the error affecting the correction hides the subtle differences in the amount of RNA transposons. This is compensated by having many single embryos: a similar trend observed in multiple embryos with the same genotype - affected by a different amount of DNA contamination and, in the case of the wt males, even coming from two different IVF drops - would be indicative of a phenotype.
+* I plot separately male and female samples and cluster the main repFamilies of retrotransposons using euclidean distance.
+
+```{r heatmap subset of TE families (FIGURE), include = TRUE, fig.height=12, fig.width=15}
+
+all_samples_TE_heatmap <- function (my_measures_table, my_samples_table, sample_cluster, elements_cluster, my_title) {
+  # making df with only the numeric values
+  pheat_df <- as.data.frame(my_measures_table)[, colnames(my_measures_table) %in% my_samples_table$sample]
+  # rownames appearing on heatmap will be the repFamily names (which are actually the repClass when there is no repFamily assigned to an element)
+  repFamilies <- gsub(".*/", "", my_measures_table$repFamClass)
+  # in cases when one repFamily name is associated to more than one repClass, duplicates are created in repFamilies vector. Using repFamClass in these cases
+  ambigous_rows <- which(duplicated(repFamilies) | duplicated(repFamilies, fromLast=TRUE))
+  repFamilies[ambigous_rows] <- my_measures_table$repFamClass[ambigous_rows]
+  rownames(pheat_df) <- repFamilies
+  # ordering samples for better visualization in case no sample clustering is required
+  setkey(my_samples_table, condition)
+  pheat_df <- pheat_df[, my_samples_table$sample]
+  # annotating samples with metadata
+  pheat_anno_samples <- data.frame(condition = my_samples_table$condition, row.names = my_samples_table$sample)
+  # annotating elements with repClasses
+  pheat_anno_elem <- data.frame(repClass = my_measures_table$repClass, repFamilies, row.names = rownames(pheat_df))
+  # ordering TE for better visualization in case no elements clustering is required
+  pheat_df <- pheat_df[order(pheat_anno_elem$repClass), ]
+  pheat_anno_elem <- pheat_anno_elem[rownames(pheat_df), ]
+  pheat_anno_elem$repFamilies <- NULL
+  # removing rows and columns having only 0s
+  pheat_df <- pheat_df[rowSums(pheat_df) != 0, colSums(pheat_df) != 0]
+  # plotting heatmap
+  pheatmap(pheat_df, cluster_rows = elements_cluster, cluster_cols = sample_cluster, annotation_col = pheat_anno_samples, annotation_row = pheat_anno_elem, show_rownames = TRUE, clustering_distance_rows = "euclidean", clustering_distance_cols = "euclidean", fontsize = 12, scale = "row", main = my_title, color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100))
+}
+
+all_samples_TE_heatmap(my_measures_table = family_FPKM_dt[family_FPKM_dt$repFamily %in% c("ERVL", "L1", "ERVK", "ERV1", "ERVL-MaLR", "B2", "Alu"), ], my_samples_table = samples_table[samples_table$sex == "F" & !(samples_table$sample %in% c("wt_9F", "het_5A", "het_3B")),], sample_cluster = FALSE, elements_cluster = TRUE, my_title = "RNA TE FPKM,\n not corrected for DNA traspososons - Females")
+
+all_samples_TE_heatmap(my_measures_table = family_FPKM_dt[family_FPKM_dt$repFamily %in% c("ERVL", "L1", "ERVK", "ERV1", "ERVL-MaLR", "B2", "Alu"), ], my_samples_table = samples_table[samples_table$sex == "M" & samples_table$sample != "het_4D",], sample_cluster = FALSE, elements_cluster = TRUE, my_title = "RNA TE FPKM,\n not corrected for DNA traspososons - Males")
+
+```
+
+A not-fully-penetrant trend of upregulation of all families of TEs is visible for male but not female samples.
+
+## PCA of male samples
+
+```{r PCA subset of families (FIGURE), include = TRUE, fig.height=12, fig.width=15}
+
+library(ade4)
+library(factoextra)
+
+pca_df <- as.data.frame(family_FPKM_dt)[family_FPKM_dt$repFamily %in% c("ERVL", "L1", "ERVK", "ERV1", "ERVL-MaLR", "B2", "Alu"), which(names(family_FPKM_dt) %in% samples_table$sample[samples_table$sex == "M" & samples_table$sample != "het_4D"])]
+row.names(pca_df) <- family_FPKM_dt[family_FPKM_dt$repFamily %in% c("ERVL", "L1", "ERVK", "ERV1", "ERVL-MaLR", "B2", "Alu"), ]$repFamily
+pca <- dudi.pca(t(log2(pca_df)), scannf = FALSE, nf = 4)
+genotype = as.character(samples_table[samples_table$sample %in% colnames(pca_df), ]$condition)
+genotype[genotype == "F_U"] <- "F_wt"
+fviz_pca_biplot(pca, repel = TRUE,
+                col.var = "black", # Variables color
+                col.ind = as.factor(genotype), # Individuals color
+                pointsize = 3)
+
+```
+
+This plot is useful because it shows the contribution of the different families to sample clustering i.e. LTR and L1 contribute more than SINE.
+
+## Testing difference in FPKM of retrotransposons' families
+
+I use the values not corrected for DNA transposons.
+
+```{r cum FPKM plot, include = TRUE}
+
+family_FPKM_dt_melt <- melt(family_FPKM_dt[, !(names(family_FPKM_dt) %in% samples_table$sample[samples_table$sex == "MF"]), with = FALSE], variable.name = "sample", value.name = "corrected_FPKM")
+family_FPKM_dt_melt <- merge(family_FPKM_dt_melt, samples_table, by = "sample" )
+family_FPKM_dt_melt$condition <- as.character(family_FPKM_dt_melt$condition)
+family_FPKM_dt_melt$condition[family_FPKM_dt_melt$condition == "F_U"] <- "F_wt"
+
+boxplot_family_FPKM <- function (my_repFamily) {
+  ggplot(family_FPKM_dt_melt[repFamily == my_repFamily], aes(x = condition, y = corrected_FPKM, color = sex)) + 
+    geom_boxplot() +
+    geom_point(aes(shape = group_or_time_point), position=position_jitter(w=0.1,h=0,seed=1), size = 3) + 
+  ylab("FPKM") +
+  #scale_y_log10() +
+  ggtitle(my_repFamily) +
+  theme(title = element_text(size = 16),
+        legend.text = element_text(size = 16), legend.title = element_text(size = 16),
+        axis.text = element_text(size = 14, angle = 60, vjust = 0.5, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+} 
+
+lapply(c("ERVL", "L1", "ERVK", "ERV1", "ERVL-MaLR", "B2", "Alu"), FUN = boxplot_family_FPKM)
+
+```
+
+Wilcoxon test on male samples:
+
+```{r FPKM diff stats, results = 'asis'}
+
+wilcoxtest_meanFPKM_my_repFam <- function (my_repFamily) {
+  p_del_wt <- wilcox.test(family_FPKM_dt_melt[repFamily == my_repFamily & condition == "M_del", ]$corrected_FPKM, family_FPKM_dt_melt[repFamily == my_repFamily & condition == "M_wt", ]$corrected_FPKM)$p.value
+  p_T931A_wt <- wilcox.test(family_FPKM_dt_melt[repFamily == my_repFamily & condition == "M_T931A", ]$corrected_FPKM, family_FPKM_dt_melt[repFamily == my_repFamily & condition == "M_wt", ]$corrected_FPKM)$p.value
+  paste0(my_repFamily, " - T931del vs wt pval = ", p_del_wt, " - T931A vs wt pval = ", p_T931A_wt)
+}
+lapply(c("ERVL", "L1", "ERVK", "ERV1", "ERVL-MaLR", "B2", "Alu"), wilcoxtest_meanFPKM_my_repFam)
+
+```
+
+# DE-Seq analysis of RNA transposons - female WT blastocysts to test the batch effect
+
+```{r adj pvalue cutoff}
+
+adjpvalue_cutoff <- 0.1
+l2fc_cutoff_to_label <- 0.2
+baseMean_cutoff_to_label <- 10
+
+```
+
+```{r customizing plot DESeq2}
+
+MA_plot_TE <- function(my_dds_res, adjpval_to_color, l2fc_to_label, baseMean_to_label, ylims, xmin) {
+  # adding label to genes which are significant and expressed above defined thresholds
+  my_dds_res$to_label <- ""
+  my_dds_res$to_label[!(is.na(my_dds_res$padj)) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label)] <- rownames(my_dds_res[!(is.na(my_dds_res$padj)) & my_dds_res$baseMean >= baseMean_to_label & my_dds_res$padj < adjpval_to_color & (my_dds_res$log2FoldChange >= l2fc_to_label | my_dds_res$log2FoldChange <= -l2fc_to_label), ])
+  my_dds_res$to_color <- ""
+  my_dds_res$to_color[!(is.na(my_dds_res$padj)) & my_dds_res$padj < adjpval_to_color] <- paste0("adjpval < ", adjpval_to_color)
+  dt_to_plot <- as.data.table(my_dds_res)
+  dt_to_plot$repName <- rownames(my_dds_res)
+  # adding color by repFamily to genes which are significant and expressed above defined thresholds
+  dt_to_plot <- merge(dt_to_plot, unique(TE_anno[,.(repName,repFamily)]), by = "repName")
+  dt_to_plot$is_sign <- dt_to_plot$repFamily
+  dt_to_plot$is_sign[is.na(my_dds_res$padj) | dt_to_plot$padj >= adjpval_to_color] <- ""
+  my.cols <- brewer.pal(length(unique(dt_to_plot$is_sign)), "Paired")
+  my.cols[1] <- "grey"
+  ggplot(dt_to_plot, aes(x = baseMean, y = log2FoldChange)) +
+    geom_point(aes(color = is_sign), alpha = 0.8) +
+    geom_text_repel(aes(label = to_label), size = 4, max.overlaps = 10, show.legend = FALSE) +
+    scale_x_log10(limits = c(xmin, NA)) +
+    ylim(ylims) +
+    scale_color_manual(values = my.cols) +
+    ggtitle(gsub(".*: stage ", "", mcols(my_dds_res)$description[4])) +
+    theme(axis.text = element_text(size = 16), axis.title = element_text(size = 16),
+          title = element_text(size = 16),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+```
+
+In this and all other DESeq comparisons:
+
+* I exclude female samples wt_9F, het_5A, het_3B and male samples het_4D. 
+* I include the **FPKM of DNA repetitive elements as confounding factors in DESeq2 formula**.
+* The threshold used for a dot to be coloured in the MA-plots is p-value adjusted < `r adjpvalue_cutoff`.
+* Transposable elements whose mean expression > `r baseMean_cutoff_to_label` and log2FoldChange > `r l2fc_cutoff_to_label` (or < -`r l2fc_cutoff_to_label`) are labeled.
+
+```{r creating DESeq inputs batch effect}
+
+# Selecting only RNA transposons and only columns with numeric values
+RNA_TE_counts_dt_batchEffect <- counts_dt[!grepl("DNA|rRNA|\\?|scRNA|Other|snRNA|tRNA|Unknown|srpRNA|RC|^RNA|Satellite", counts_dt$repClass), samples_table$sample[samples_table$condition %in% c("F_wt", "F_U")  & !(samples_table$sample %in% c("wt_9F", "het_5A", "het_3B"))], with = FALSE]
+
+# A count matrix will be the input for DESeq
+counts_m_batchEffect <- as.matrix(RNA_TE_counts_dt_batchEffect)
+rownames(counts_m_batchEffect) <- counts_dt[!grepl("DNA|rRNA|\\?|scRNA|Other|snRNA|tRNA|Unknown|srpRNA|RC|^RNA|Satellite", counts_dt$repClass), ]$repName
+# the design df is created from the samples_table
+design_df_batchEffect <- data.frame(genotype = samples_table$condition[samples_table$condition %in% c("F_wt", "F_U") & !(samples_table$sample %in% c("wt_9F", "het_5A", "het_3B"))], mother_genotype = samples_table$group_or_time_point[samples_table$condition %in% c("F_wt", "F_U") & !(samples_table$sample %in% c("wt_9F", "het_5A", "het_3B"))])
+# the rownames of the design df have to be the same (and in the same order) of the colnames of the count matrix
+rownames(design_df_batchEffect) <- samples_table$sample[samples_table$condition %in% c("F_wt", "F_U") & !(samples_table$sample %in% c("wt_9F", "het_5A", "het_3B"))]
+# adding another DNA transposons FPKM as an additional variable, that can be used as confounding factor
+design_df_batchEffect$DNA_FPKM <- DNA_TE_FPKM[samples_table$sample[samples_table$condition %in% c("F_wt", "F_U") & !(samples_table$sample %in% c("wt_9F", "het_5A", "het_3B"))]]
+design_df_batchEffect$sample <- rownames(design_df_batchEffect)
+
+```
+
+```{r DESeq batch effect}
+
+dds_batchEffect <- DESeqDataSetFromMatrix(countData = counts_m_batchEffect,
+                              colData = design_df_batchEffect,
+                              design = ~ DNA_FPKM + mother_genotype)
+keep <- rowSums(counts(dds_batchEffect)) >= 10
+dds_batchEffect <- dds_batchEffect[keep,]
+dds_batchEffect <- DESeq(dds_batchEffect)
+# extracting result table from the DESeq analysis
+res_batchEffect <- lfcShrink(dds_batchEffect, contrast=c("mother_genotype","T931A_IVF","wt_or_T931del_IVF"), alpha=adjpvalue_cutoff, type="ashr")
+
+```
+
+```{r MA plot batch effect, include = TRUE}
+
+MA_plot_TE(res_batchEffect, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = l2fc_cutoff_to_label, baseMean_to_label = baseMean_cutoff_to_label, ylims = c(-2,2), xmin = 1)
+
+```
+
+# DE-Seq analysis of RNA transposons - male blastocysts only
+
+```{r creating DESeq inputs males}
+
+# Selecting only RNA transposons and only columns with numeric values
+RNA_TE_counts_dt_males <- counts_dt[!grepl("DNA|rRNA|\\?|scRNA|Other|snRNA|tRNA|Unknown|srpRNA|RC|^RNA|Satellite", counts_dt$repClass), samples_table$sample[samples_table$sex == "M" & samples_table$sample != "het_4D"], with = FALSE]
+
+# A count matrix will be the input for DESeq
+counts_m_males <- as.matrix(RNA_TE_counts_dt_males)
+rownames(counts_m_males) <- counts_dt[!grepl("DNA|rRNA|\\?|scRNA|Other|snRNA|tRNA|Unknown|srpRNA|RC|^RNA|Satellite", counts_dt$repClass), ]$repName
+# the design df is created from the samples_table
+design_df_males <- data.frame(genotype = samples_table$condition[samples_table$sex == "M" & samples_table$sample != "het_4D"], mother_genotype = samples_table$group_or_time_point[samples_table$sex == "M" & samples_table$sample != "het_4D"])
+# the rownames of the design df have to be the same (and in the same order) of the colnames of the count matrix
+rownames(design_df_males) <- samples_table$sample[samples_table$sex == "M" & samples_table$sample != "het_4D"]
+# adding another DNA transposons FPKM as an additional variable, that can be used as counfounding factor
+design_df_males$DNA_FPKM <- DNA_TE_FPKM[samples_table$sample[samples_table$sex == "M" & samples_table$sample != "het_4D"]]
+design_df_males$sample <- rownames(design_df_males)
+
+```
+
+```{r DESeq males}
+
+dds_males <- DESeqDataSetFromMatrix(countData = counts_m_males,
+                              colData = design_df_males,
+                              design = ~ DNA_FPKM + genotype)
+keep <- rowSums(counts(dds_males)) >= 10
+dds_males <- dds_males[keep,]
+dds_males <- DESeq(dds_males)
+# extracting result table from the DESeq analysis
+res_males_del <- lfcShrink(dds_males, contrast=c("genotype","M_del","M_wt"), alpha=adjpvalue_cutoff, type="ashr")
+
+```
+
+```{r ranked DE genes}
+
+# Function which takes a DESeq results object and return it as a dataframe, with genes ordered by pvalue and filtered by adjusted pvalue
+pvalue_ranked_DE <- function (my_res) {
+  # keeping only genes with adjusted pvalue below my threshold
+  my_res_f <- subset(my_res, padj < adjpvalue_cutoff)
+  # ordering by pvalue
+  my_res_f_ord <- my_res_f[order(my_res_f$pvalue),]
+  my_res_f_ord$repName <- rownames(my_res_f_ord)
+  return(my_res_f_ord)
+}
+
+pvalue_ranked_DE_list_males_del <- pvalue_ranked_DE(res_males_del)
+
+```
+
+```{r DE TEs, results='asis'}
+
+knitr::kable(pvalue_ranked_DE_list_males_del, row.names = FALSE, caption = "Males T931del vs wt")
+
+```
+
+```{r MA plot males, include = TRUE}
+
+MA_plot_TE(res_males_del, adjpval_to_color = adjpvalue_cutoff, l2fc_to_label = l2fc_cutoff_to_label, baseMean_to_label = baseMean_cutoff_to_label, ylims = c(-2,2), xmin = 10)
+
+```
+
+## FPKM of DE TEs
+
+```{r FPKM of DE TE, include = TRUE, fig.height=8, fig.width=14}
+
+## compute FPKM dt for repNames
+
+cols <- c("Length", names(counts_dt)[names(counts_dt) %in% samples_table$sample])
+# only repeats with rowMeans > 5
+counts_dt_f <- counts_dt[rowMeans(counts_dt[, cols[2:length(cols)], with = FALSE]) > 5, ]
+# divide each column by library size and multiply by 10^6
+rep_FPKM_dt <- sweep(counts_dt_f[, cols[2:length(cols)], with = FALSE], 2, library_size_dt$library_size/1000000, FUN = '/')
+# divide each row by rep length
+rep_FPKM_dt <- as.data.table(sweep(rep_FPKM_dt, 1, counts_dt_f$Length/1000, FUN = '/'))
+rep_FPKM_dt$repName <- counts_dt_f$repName
+rep_FPKM_dt$repFamClass <- counts_dt_f$repFamClass
+
+## make long table for plotting
+rep_FPKM_dt_melt <- melt(rep_FPKM_dt, variable.name = "sample", value.name = "FPKM")
+rep_FPKM_dt_melt <- merge(rep_FPKM_dt_melt, samples_table[, c("sample", "condition", "group_or_time_point")], by = "sample" )
+rep_FPKM_dt_melt$condition[rep_FPKM_dt_melt$condition == "F_U"] <- "F_wt" #simplify female genotype for plotting since U are most likely wt
+rep_FPKM_dt_melt$sex <- gsub("_.*", "" , rep_FPKM_dt_melt$condition)
+rep_FPKM_dt_melt$genotype <- gsub(".*_", "" , rep_FPKM_dt_melt$condition)
+
+my_TEs_up <- setNames(pvalue_ranked_DE_list_males_del$repName[pvalue_ranked_DE_list_males_del$log2FoldChange > 0], nm = pvalue_ranked_DE_list_males_del$repName[pvalue_ranked_DE_list_males_del$log2FoldChange > 0])
+my_TEs_down <- setNames(pvalue_ranked_DE_list_males_del$repName[pvalue_ranked_DE_list_males_del$log2FoldChange < 0], nm = pvalue_ranked_DE_list_males_del$repName[pvalue_ranked_DE_list_males_del$log2FoldChange < 0])
+
+## plot downregulated DE TEs
+
+ROIs_dt <- rep_FPKM_dt_melt[repName %in% my_TEs_down]
+ROIs_dt$repName <- factor(ROIs_dt$repName, levels = my_TEs_down)
+
+ggplot(data = ROIs_dt, aes(x = condition, y = FPKM, color = sex)) +
+  geom_boxplot() +
+  ggtitle("downregulated TEs") +
+  geom_point(aes(shape = group_or_time_point), position = position_jitter(width = 0.1)) +
+  facet_wrap("repName", scales = "free_y", nrow = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+## plot upregulated DE TEs
+
+ROIs_dt <- rep_FPKM_dt_melt[repName %in% my_TEs_up]
+ROIs_dt$repName <- factor(ROIs_dt$repName, levels = my_TEs_up)
+
+ggplot(data = ROIs_dt, aes(x = condition, y = FPKM, color = sex)) +
+  geom_boxplot() +
+  ggtitle("upregulated TEs") +
+  geom_point(aes(shape = group_or_time_point), position = position_jitter(width = 0.1)) +
+  facet_wrap("repName", scales = "free_y", nrow = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+```
+
+## Comparing DE TEs with developmentally dynamic TEs
+
+* TE dynamics across preimplantation development was analyzed using the preimplantation WT samples from [GSE66582](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE66582) (MII oocyte to inner cell mass) and [GSE76505](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE76505) (E3.5 to E7.5).
+* I focus on the 8-cell to E3.5 ICM and 8-cell to E3.5 trophectoderm transition as the relevant one for the comparison with the mutant blastocysts.
+
+```{r DE TEs vs dev TEs, include = TRUE}
+
+load("Rdata/WeiXie_development_TE/res_list.Rdata") #Rdata was generated in TE_preimpl_dynamics.Rmd
+development_TE_all <- res_list
+
+## Working on T931del vs wt blastocysts DESeq result
+# DESeq object to df
+res_males_del_df <- as.data.frame(res_males_del)
+# filtering out lowly expressed TEs
+res_males_del_df <- res_males_del_df[res_males_del_df$baseMean > 10 & !(is.na(res_males_del_df$padj)), ]
+res_males_del_df$repName <- rownames(res_males_del_df)
+
+## doing the same for wt E3.5 ICM vs wt 8-cell embryo DESeq result
+ICM_TE_df <- as.data.frame(development_TE_all$E35_ICM)
+ICM_TE_df <- ICM_TE_df[ICM_TE_df$baseMean > 10 & !(is.na(ICM_TE_df$padj)), ]
+ICM_TE_df$repName <- rownames(ICM_TE_df)
+
+## doing the same for wt E3.5 trophectoderm vs wt 8-cell embryo DESeq result
+tropho_TE_df <- as.data.frame(development_TE_all$E35_TE)
+tropho_TE_df <- tropho_TE_df[tropho_TE_df$baseMean > 10 & !(is.na(tropho_TE_df$padj)), ]
+tropho_TE_df$repName <- rownames(tropho_TE_df)
+
+## making combined blastocyst DE values
+# merging DE dfs for the two blastocyst tissues
+blasto_TE_df <- merge(ICM_TE_df, tropho_TE_df, by = "repName", suffixes = c(".ICM", ".tropho"))
+# compute linear combination of log2FCs with the assumption that trophectoderm cells are ~75% of blastocyst cells
+blasto_TE_df$log2FoldChange.blasto <- (25*blasto_TE_df$log2FoldChange.ICM + 75*blasto_TE_df$log2FoldChange.tropho)/100
+# merging with mutation DE df
+comp_df <- merge(x = res_males_del_df, y = blasto_TE_df, by = "repName")
+# adding TE annotation
+comp_df <- merge(comp_df, unique(TE_anno[, .(repName, repFamily)]), by = "repName")
+# labeling in the plot only repNames which are significantly deregulated in T931del vs wt blastocysts
+comp_df$is_sign <- ifelse(comp_df$padj < 0.1, "mut_DE", "")
+comp_df$label <- comp_df$repName
+comp_df$label[comp_df$is_sign == ""] <- ""
+ggplot(comp_df, aes(log2FoldChange.blasto, log2FoldChange)) +
+  geom_point(aes(color = repFamily)) +
+  geom_text_repel(aes(label = label), size = 2) +
+  ylim(c(-1.5,+1.5)) +
+  ggtitle("T931Adel DE vs 8c to E3.5 blastocyst DE")
+
+# computing correlation for the significantly diff expr TEs in T931del mutants
+cor(x = comp_df[comp_df$padj < 0.1, ]$log2FoldChange, y = comp_df[comp_df$padj < 0.1, ]$log2FoldChange.blasto, method = "pearson")
+cor(x = comp_df$log2FoldChange, y = comp_df$log2FoldChange.blasto, method = "pearson")
+
+```
+
+### Conclusion
+
+TEs which are upregulated in the mutant are downregulated between the 8c and ICM in WT embryos, hence their deregulation could potentially partly be due to a developmental delay. However, the developmental delay cannot completely explain TE upregulation, because the negative correlation that we would expect between developmental changes and changes due to the mutation is very low.
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```

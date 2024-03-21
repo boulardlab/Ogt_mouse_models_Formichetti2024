@@ -1,0 +1,450 @@
+---
+title: "SMART-Seq2 mRNA-Seq of blastocysts from wt M PWD x F FVB OgtT931A-het or OgtT931del-het/wt - embryo filtering and clustering"
+date: "January 19th, 2024"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide', fig.width=12, fig.height=8)
+
+```
+
+```{r Setting the seed to obtain reproducible PCA plots}
+
+set.seed(1)
+
+```
+
+```{r loading needed packages}
+
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library("DESeq2")
+library(ggpubr)
+library(gridExtra)
+library(pheatmap)
+library(ggrepel)
+library(vsn)
+library(dplyr)
+
+```
+
+```{r creating tx2gene and geneID2name df}
+
+# Creating the transcriptID2geneID df; the transcriptID2geneID tsv file has been created with custom shell script tx2gene_from_encode_gtf.sh in src/sh folder
+tx2gene <- fread("../../data/annotations/gencode.vM25.annotation.tx2gene.tsv", col.names = c("tx_id", "gene_id"))
+# removing version
+tx2gene <- tx2gene[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(tx2gene)]
+
+# Creating the geneID2geneName df; the geneID2geneName tsv file has been created with custom shell script geneID2name_from_encode_gtf.sh in src/sh folder
+geneID2name <- fread("../../data/annotations/gencode.vM25.annotation.geneID2name.tsv", col.names = c("gene_id", "gene_name"))
+# removing version
+geneID2name <- geneID2name[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(geneID2name)]
+
+# Merging the 2 dfs
+gene_map_dt <- as.data.table(merge(geneID2name, tx2gene, by = "gene_id"))
+
+```
+
+# Design of the experiment
+
+```{r files path}
+
+# directory containing featureCounts outputs
+dir <- "../../data/sequencing/featureCounts/STAR_default"
+# vector of file names
+files <- grep("_counts", sort(list.files(path = dir)), value = TRUE)
+# adding the path
+files_w_path <- file.path(dir, files)
+
+```
+
+```{r reading sample metadata}
+
+# reading table containing sample names and day of collection
+samples_table <- fread("../../data/sequencing/samples_table.csv")
+design_df <- as.data.frame(samples_table)
+design_df$sample <- gsub("wt_", "", design_df$sample)
+design_df$sample <- gsub("het_", "", design_df$sample)
+# getting sex info from sample condition
+design_df$sex <- gsub("_.*", "", design_df$condition)
+# getting genotype info from sample condition
+design_df$genotype <- gsub(".*_", "", design_df$condition)
+# excluding M sample 12D because of absence of reads on mutation locus hence unknown genotype
+design_df <- design_df[design_df$sample != "12D", ]
+
+```
+
+```{r adding library size}
+
+# reading STAR log output summarized by MultiQC
+STAR_log <- fread("../../data/sequencing/qc/MultiQC/STAR_workflow/star")
+# get sample names from file names
+STAR_log$sample <- gsub("H2KK3BGXV_OgtT931A_blasto_23s002557-1-1_Formichetti_lane1", "", gsub("sequence_txt", "", STAR_log$Sample))
+STAR_log$sample <- gsub("wt", "", STAR_log$sample)
+STAR_log$sample <- gsub("het", "", STAR_log$sample)
+design_df <- merge(design_df, STAR_log[,.(sample, total_reads, uniquely_mapped, multimapped_percent)], by = "sample")
+rownames(design_df) <- design_df$sample # necessary to make dds
+
+```
+
+Column 'condition' (genotype of the embryos) is based on previous in silico establishment of sex (exactly as done below) and - for presence of the mutations - on cDNA genotyping (for T931A mothers) or manual inspection of the reads (for T931del or wt mothers). For female embryos coming from wt or del mothers, if no evidence of the mutation is found among the reads, the mutation can still not be excluded because of the presence of the wt allele; hence, they are annotated as F_U (for "unknown") even if most likely almost all are WT because of high number of reads for most of them.
+
+```{r design table, results='asis'}
+
+knitr::kable(design_df, row.names = FALSE)
+
+```
+
+```{r reading counts}
+
+# reading and merging all files in one data.frame by Geneid
+counts_table <- as.data.frame(Reduce(function(...) merge(..., by = c("Geneid")), lapply(files_w_path, function (f) {fread(f)})))
+# simplifying colnames by leaving only the sample name
+colnames(counts_table) <- gsub("H2KK3BGXV_OgtT931A_blasto_23s002557-1-1_Formichetti_lane1", "", gsub("sequence.txt", "", names(counts_table)))
+colnames(counts_table) <- gsub("wt", "", colnames(counts_table))
+colnames(counts_table) <- gsub("het", "", colnames(counts_table))
+# adding gene ids as rownames
+rownames(counts_table) <- counts_table$Geneid
+counts_table$Geneid <- NULL
+# removing version from gene ids
+rownames(counts_table) <- gsub("\\..*", "", rownames(counts_table))
+# excluding M sample 12D because of absence of reads on mutation locus hence unknown genotype
+counts_table <- counts_table[, colnames(counts_table) != "12D"]
+# reordering counts table based on sample order in design df
+counts_table <- counts_table[, rownames(design_df)]
+
+```
+
+# Quality filtering of embryos
+
+```{r mt genes in metadata}
+
+# reading mt genes
+mt_genes <- fread("../../data/annotations/gencode.vM25.mt_genes.csv")
+# removing version from gene id
+mt_genes$gene_id <- gsub("\\..*", "", mt_genes$gene_id)
+
+# for each sample, proportion of counts for mt genes
+counts_table_qc <- as.data.table(counts_table)
+counts_table_qc$gene_id <- rownames(counts_table)
+mt_genes_counts <- apply(merge(counts_table_qc, mt_genes, by = "gene_id", all.x = FALSE, all.y = TRUE)[, 2:ncol(counts_table_qc)], 2, sum)
+tot_counts <- apply(counts_table, 2, sum)
+mt_genes_table <- data.table(sample = colnames(counts_table), mt_genes_counts = mt_genes_counts, tot_counts = tot_counts)
+design_df <- merge(design_df, mt_genes_table, by = "sample")
+rownames(design_df) <- design_df$sample
+counts_table <- counts_table[, rownames(design_df)]
+
+```
+
+```{r quality filtering plot, include = TRUE}
+
+ggplot(data = design_df, aes(x = seq(1,nrow(design_df)), y = mt_genes_counts/tot_counts*100, label = sample, color = group_or_time_point)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3) +
+  xlab("index") +
+  ylab("perc mt genes counts") +
+  theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+ggplot(data = design_df, aes(x = seq(1,nrow(design_df)), y = mt_genes_counts/tot_counts*100, label = sample, color = condition)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3) +
+  xlab("index") +
+  ylab("perc mt genes counts") +
+  theme(title = element_text(size = 20),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        axis.text = element_text(size = 19),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+```
+
+No need to remove any embryo.
+
+# Verifying sex of embryos
+
+```{r building dds for sex verification}
+
+dds <- DESeqDataSetFromMatrix(countData = counts_table,
+                              colData = design_df,
+                              design = ~ condition)
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+dds <- DESeq(dds)
+
+```
+
+```{r sexing gene counts}
+
+sexing_genes <- gene_map_dt[gene_name %in% c("Ddx3y", "Eif2s3y", "Xist"), unique(gene_id)]
+names(sexing_genes) <- gene_map_dt[gene_name %in% c("Ddx3y", "Eif2s3y", "Xist"), unique(gene_name)]
+
+get_norm_dds_counts <- function (my_gene_id, my_dds, my_design_df) {
+  c <- plotCounts(dds, gene = my_gene_id, intgroup = c("sample", "group_or_time_point", "sex", "genotype"), returnData = TRUE, normalized = TRUE)
+  names(c)[grep("count", names(c))] <- paste0("count", ".", gene_map_dt[gene_id %in% my_gene_id, unique(gene_name)])
+  return(c)
+}
+
+sexing_gene_counts_list <- lapply(sexing_genes, get_norm_dds_counts, my_dds = dds, my_design_df = design_df)
+sexing_gene_counts <- Reduce(function(...) merge(...,by = c("sample", "group_or_time_point", "sex", "genotype")), sexing_gene_counts_list)
+
+```
+
+```{r plot sexing counts, include = TRUE}
+
+ggplot(sexing_gene_counts, aes(x = log(count.Ddx3y), y = log(count.Eif2s3y), colour = sex, label = sample, shape = genotype)) +
+  geom_point(size = 3) +
+  geom_text_repel(size = 3, max.overlaps = 30) +
+  theme(title = element_text(size = 16),
+        legend.text = element_text(size = 16), legend.title = element_text(size = 16),
+        axis.text = element_text(size = 16),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+```
+
+Sex is confirmed for all embryos.
+
+# Embryo genotypes summary
+
+```{r genotypes summary, results='asis'}
+
+knitr::kable(table(design_df$sex, design_df$genotype), row.names = TRUE)
+knitr::kable(table(design_df$condition, design_df$group_or_time_point), row.names = TRUE)
+
+```
+
+# Sample clustering
+
+## Heatmap for quality assessment
+
+After applying the log2(n + 1) transformation, I plot heatmaps of normalized counts for top highly expressed genes to check for eventual big sample heterogeneity present in the dataset. 
+
+```{r pheatmap after data transformation,  include = TRUE}
+
+highest_expr_hm <- function (my_dds, my_title) {
+  select <- order(rowMeans(counts(my_dds, normalized = FALSE)), decreasing = TRUE)[1:20]
+  design_df_h <- as.data.frame(colData(my_dds)[,c("group_or_time_point", "condition")])
+  rownames(design_df_h) <- colnames(counts(my_dds))
+  colnames(design_df_h) <- c("group_or_time_point", "condition")
+  my_ntd <- normTransform(my_dds)
+  pheatmap(assay(my_ntd)[select,], cluster_rows = FALSE, show_rownames = TRUE, show_colnames = TRUE, cluster_cols = TRUE, annotation_col = design_df_h, main = my_title)
+}
+
+highest_expr_hm(dds, my_title = "")
+
+```
+
+No emerging sample heterogeneity.
+
+## PCA
+
+```{r defining mean threshold and var genes number threshold}
+
+my_mean_threshold <- 10
+my_ntop <- 1000
+
+```
+
+For this PCA:
+
+1. I start with DESeq2-normalized data
+2. I keep only genes with DESeq2-normalized mean across samples > `r my_mean_threshold`
+3. I apply log2 transformation
+4. I perform PCA with package prcomp using the `r my_ntop` genes with the highest variance
+
+```{r PCA functions}
+
+plotPCA_DESeq_norm_data <- function (my_dds, intgroup, mean_threshold, ntop, returnData = TRUE) {
+    # computing row means of DESeq2-normalized counts
+    rM <- rowMeans2(counts(my_dds, normalized = TRUE))
+    # creating object of normTransformed data i.e. log2 transformed DESeq2-normalized data
+    ntd <- normTransform(my_dds)
+    # keeping only genes with rowMean > my threshold
+    f_norm_counts <- assay(ntd)[rM > mean_threshold, ]
+    # computing row vars of log2 transformed DESeq2-normalized counts
+    rv <- rowVars(f_norm_counts)
+    # selecting the first ntop genes based on var computed on line above
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop,length(rv)))]
+    # pca of the selected genes
+    pca <- prcomp(t(f_norm_counts[select, ]))
+    percentVar <- pca$sdev^2/sum(pca$sdev^2)
+    if (!all(intgroup %in% names(colData(my_dds)))) {
+        stop("the argument 'intgroup' should specify columns of colData(dds)")
+    }
+    intgroup.df <- as.data.frame(colData(my_dds)[, intgroup, drop = FALSE])
+    group <- if (length(intgroup) > 1) {
+        factor(apply(intgroup.df, 1, paste, collapse = ":"))
+    }
+    else {
+        colData(my_dds)[[intgroup]]
+    }
+    d <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], PC3 = pca$x[, 3], PC4 = pca$x[, 4], intgroup.df, name = colnames(my_dds))
+    if (returnData) {
+        attr(d, "percentVar") <- percentVar[1:4]
+        return(d)
+    }
+}
+
+plotPCA_DESeq_norm <- function (my_dds, intgroup, mean_threshold, ntop, PC_x, PC_y) {
+  pcaData <- plotPCA_DESeq_norm_data(my_dds = my_dds, intgroup = intgroup, mean_threshold = mean_threshold, ntop = ntop, returnData = TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  par(mfrow=c(2,1))
+  ggplot(pcaData, aes(pcaData[, PC_x], pcaData[, PC_y], color=pcaData[,5], shape=pcaData[,6], label = rownames(pcaData))) +
+    geom_point(size=4) +
+    xlab(paste0("PC",PC_x,": ",percentVar[PC_x],"% variance")) +
+    ylab(paste0("PC",PC_y,": ",percentVar[PC_y],"% variance")) +
+    scale_color_discrete(name = colnames(pcaData)[5]) +
+    scale_shape_discrete(name = colnames(pcaData)[6]) +
+    geom_text_repel(size = 3) +
+    coord_fixed() +
+    theme(axis.text = element_text(size = 22), axis.title = element_text(size = 22),
+        title = element_text(size = 22),
+        legend.text = element_text(size = 22), legend.title = element_text(size = 22),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+}
+
+plotEigen_DESeq_norm_data <- function (my_dds, mean_threshold, ntop, returnData = TRUE) {
+    # computing row means of DESeq2-normalized counts
+    rM <- rowMeans2(counts(my_dds, normalized = TRUE))
+    # creating object of normTransformed data i.e. log2 transformed DESeq2-normalized data
+    ntd <- normTransform(my_dds)
+    # keeping only genes with rowMean > my threshold
+    f_norm_counts <- assay(ntd)[rM > mean_threshold, ]
+    # computing row vars of log2 transformed DESeq2-normalized counts
+    rv <- rowVars(f_norm_counts)
+    # selecting the first ntop genes based on var computed on line above
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop,length(rv)))]
+    # pca of the selected genes
+    pca <- prcomp(t(f_norm_counts[select, ]))
+    percentVar <- pca$sdev^2/sum(pca$sdev^2)
+    barplot(percentVar)
+}
+
+```
+
+### female blastocysts
+
+```{r DESeq dataset only F}
+
+# Re-creating dds object
+dds_F <- DESeqDataSetFromMatrix(countData = counts_table[, colnames(counts_table) %in% design_df$sample[design_df$sex == "F"]],
+                              colData = design_df[design_df$sex == "F", ],
+                              design = ~ group_or_time_point) # not important here
+# pre-filtering low count genes in order to speed up the following computations
+keep <- rowSums(counts(dds_F)) >= 10
+dds_F <- dds_F[keep,]
+
+dds_F <- DESeq(dds_F)
+
+```
+
+```{r PCA plots only F (FIGURE), include = TRUE}
+
+plotPCA_DESeq_norm(my_dds = dds_F, intgroup = c("genotype", "group_or_time_point"), mean_threshold = my_mean_threshold, ntop = my_ntop, PC_x = 1, PC_y = 2)
+plotPCA_DESeq_norm(my_dds = dds_F, intgroup = c("genotype", "group_or_time_point"), mean_threshold = my_mean_threshold, ntop = my_ntop, PC_x = 2, PC_y = 3)
+plotEigen_DESeq_norm_data(my_dds = dds_F, mean_threshold = my_mean_threshold, ntop = my_ntop)
+
+```
+
+### male blastocysts
+
+```{r DESeq dataset only M}
+
+# Re-creating dds object
+dds_M <- DESeqDataSetFromMatrix(countData = counts_table[, colnames(counts_table) %in% design_df$sample[design_df$sex == "M"]],
+                              colData = design_df[design_df$sex == "M", ],
+                              design = ~ group_or_time_point) # not important here
+# pre-filtering low count genes in order to speed up the following computations
+keep <- rowSums(counts(dds_M)) >= 10
+dds_M <- dds_M[keep,]
+
+dds_M <- DESeq(dds_M)
+
+```
+
+```{r PCA plots only M (FIGURE), include = TRUE}
+
+plotPCA_DESeq_norm(my_dds = dds_M, intgroup = c("genotype", "group_or_time_point"), mean_threshold = my_mean_threshold, ntop = my_ntop, PC_x = 1, PC_y = 2)
+plotPCA_DESeq_norm(my_dds = dds_M, intgroup = c("genotype", "group_or_time_point"), mean_threshold = my_mean_threshold, ntop = my_ntop, PC_x = 2, PC_y = 3)
+plotEigen_DESeq_norm_data(my_dds = dds_M, mean_threshold = my_mean_threshold, ntop = my_ntop)
+
+```
+
+### Conclusions
+
+* Female embryos do not cluster based on the different Ogt genotypes.
+* For male embryos only, some separation between wt and Ogt-mutant ones is evident on PC3.
+
+### How I will proceed
+
+* Testing gene expression differences between male del and wt embryos, adding IVF drop as batch effect in DESeq2 formula.
+* Comparing gene expression differences above with the ones observed for female wt embryos between the two IVF drops, which can be a proxy of the batch effect.
+
+```{r saving Rdata}
+
+save(counts_table, file = "Rdata/counts_table.Rdata")
+save(design_df, file = "Rdata/design_df.Rdata")
+save(gene_map_dt, file = "Rdata/gene_map_dt.Rdata")
+save(geneID2name, file = "Rdata/geneID2name.Rdata")
+
+```
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

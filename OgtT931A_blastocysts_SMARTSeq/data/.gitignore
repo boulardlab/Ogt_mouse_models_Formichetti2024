@@ -1,0 +1,11 @@
+*
+!README.md
+!.gitignore
+sequencing/*
+!sequencing/samples_table.csv
+embryo_public_data_GSE66582_GSE76505/*
+!embryo_public_data_GSE66582_GSE76505/sequencing/
+embryo_public_data_GSE66582_GSE76505/sequencing/*
+!embryo_public_data_GSE66582_GSE76505/sequencing/SraRunTable_selection.csv
+!embryo_public_data_GSE66582_GSE76505/sequencing/SraRunTable_selection_TE_analysis.csv
+!embryo_public_data_GSE66582_GSE76505/sequencing/samples_table_TE_analysis.csv

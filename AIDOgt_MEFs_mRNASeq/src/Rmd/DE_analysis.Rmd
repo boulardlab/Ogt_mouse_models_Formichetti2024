@@ -1,0 +1,738 @@
+---
+title: "Auxin-treated AID-Ogt MEFs Differential Expression analysis"
+date: "August 27, 2021"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+---
+
+```{r Setting general options, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide', fig.width=12, fig.height=8)
+
+```
+
+```{r loading needed packages}
+
+library("DESeq2")
+library("tximport")
+library(ggplot2)
+library(reshape2)
+library("vsn")
+library(ggpubr)
+library(gplots)
+library(gridExtra)
+library(data.table)
+library(DOSE)
+library(tidytext)
+
+```
+
+```{r customizing plots DESeq2}
+
+# Changes are storage of 4 PCs (instead of only 2) in the pcaData object and removal of ggplot part (just to avoid redundancy because I will anyway customize the plotting in the function in chunck 'clustering samples') 
+plotPCA_data <- function (object, intgroup = "condition", ntop = 500, returnData = TRUE) {
+    rv <- rowVars(assay(object))
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop,length(rv)))]
+    pca <- prcomp(t(assay(object)[select, ]))
+    percentVar <- pca$sdev^2/sum(pca$sdev^2)
+    if (!all(intgroup %in% names(colData(object)))) {
+        stop("the argument 'intgroup' should specify columns of colData(dds)")
+    }
+    intgroup.df <- as.data.frame(colData(object)[, intgroup, 
+        drop = FALSE])
+    group <- if (length(intgroup) > 1) {
+        factor(apply(intgroup.df, 1, paste, collapse = ":"))
+    }
+    else {
+        colData(object)[[intgroup]]
+    }
+    d <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], PC3 = pca$x[, 3], PC4 = pca$x[, 4], group = group, 
+        intgroup.df, name = colnames(object))
+    if (returnData) {
+        attr(d, "percentVar") <- percentVar[1:4]
+        return(d)
+    }
+}
+
+pval_hist <- function (dds_res) {
+  ggplot(as(dds_res, "data.frame"), aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.01, fill = "Royalblue", boundary = 0) +
+  ggtitle(gsub(" vs ", "\nvs ", gsub("(.*group )|(.*: )", "", mcols(dds_res)$description[4]))) +
+  scale_x_continuous(breaks=c(0.0, 0.5, 1)) +
+  theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20),
+        title = element_text(size = 18),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        legend.key.height = unit(1.5,"line"))
+}
+MA_plot <- function(dds_res, adjpval) {
+  DESeq2::plotMA(dds_res, alpha = adjpval, main = gsub("(.*group )|(.*: )", "", mcols(dds_res)$description[4]), cex.lab = 2, cex.axis = 2, cex.main = 2, ylim = c(-3,3))
+}
+
+```
+
+# Design of the experiment
+
+1. 3 biological replicates, each one composed of a pair of MEFs clones coming from the same litter
+2. For each biological replicate, each pair of clones is composed of:
+  + an OsTIR1-only clone, which expresses OsTIR1 but not the AID-Ogt isoform, thus auxin treatment is not supposed to cause any OGT depletion. This clone represents the control of the corresponding biological replicate
+  + an AID-Ogt;OsTIR clone, which bears both genomic modifications necessary to obtain OGT depletion after auxin treatment.
+3. All clones (both controls and AID-Ogt;OsTIR clones) were collected in the following conditions:
+  + without any auxin addition (No auxin)
+  + after 24h of auxin treatment
+  + after 48h of auxin treatment
+  + after 4 days of auxin treatment.
+
+```{r creating tx2gene and geneID2name df}
+
+# Creating the transcriptID2geneID df; the transcriptID2geneID tsv file has been created with custom shell script tx2gene_from_encode_gtf.sh in src/sh folder
+tx2gene <- fread("../../data/annotations/gencode.vM25.annotation.tx2gene.tsv", col.names = c("tx_id", "gene_id"))
+# removing version
+tx2gene <- tx2gene[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(tx2gene)]
+### Adding to the tx2gene DataFrame the transcript-gene pair corresponding to OsTIR
+tg_tx2gene <- DataFrame(tx_id = c("OsTIR1"), gene_id = paste0(c("OsTIR1"), "_gene"))
+tx2gene_w_ex <- rbind(tx2gene, tg_tx2gene)
+
+# Creating the geneID2geneName df; the geneID2geneName tsv file has been created with custom shell script geneID2name_from_encode_gtf.sh in src/sh folder
+geneID2name <- fread("../../data/annotations/gencode.vM25.annotation.geneID2name.tsv", col.names = c("gene_id", "gene_name"))
+# removing version
+geneID2name <- geneID2name[,  lapply(.SD, gsub, pattern = "\\..*", replacement = ""), .SDcols = names(geneID2name)]
+# Adding the transgenes
+tg_geneID2name <- DataFrame(gene_id = paste0(c("OsTIR1"), "_gene"), gene_name = "OsTIR1")
+geneID2name_w_ex <- rbind(geneID2name, tg_geneID2name)
+
+# Merging the 2 dfs
+gene_map_dt <- as.data.table(merge(geneID2name_w_ex, tx2gene_w_ex, by = "gene_id"))
+
+```
+
+```{r creating the txi object}
+
+# specifying the directory containing Salmon outputs modified to be suitable tximport inputs
+dir <- "../../data/sequencing/Salmon_ENCODE"
+
+files <- sort(list.files(path = dir))
+
+# making the  character vector of names of Salmon quantification's files
+files_w_path <- file.path(dir, files)
+
+# tximport gene level summarization of transcripts' quantification
+txi_w_ex <- tximport(files_w_path, type="salmon", tx2gene=tx2gene_w_ex, ignoreTxVersion = TRUE)
+
+```
+
+```{r creating the design data frame}
+
+control_clones <- c("32", "47", "50")
+
+design_df <- DataFrame(samples = gsub("_Salmon.*$", "", files))
+design_df$clone <- gsub("_.*", "", design_df$samples)
+design_df$time_point <- gsub(".*_", "", design_df$samples)
+design_df$genotype <- ifelse(design_df$clone %in% control_clones, "ctrl", "AIDOgt")
+design_df$condition <- ifelse(design_df$time_point == "NO", "untreated", "auxin")
+design_df$biol_rep <- as.character(rep(1:3, each = 8))
+# redefining the reference levels for some factors of the design dataframe
+design_df$condition <- relevel(as.factor(design_df$condition), ref = "untreated")
+design_df$genotype <- relevel(as.factor(design_df$genotype), ref = "ctrl")
+# Creating a factor which is the combination of both time point and genotype
+design_df$group <- factor(paste0(design_df$genotype, design_df$time_point))
+
+# renaming columns of txi matrices object as the sample names
+colnames(txi_w_ex$counts) <- design_df$samples
+colnames(txi_w_ex$abundance) <- design_df$samples
+colnames(txi_w_ex$length) <- design_df$samples
+
+```
+
+```{r creating the DESeqDataSet}
+
+# Creating tximport object
+txi_w_ex <- tximport(files_w_path, type="salmon", tx2gene=tx2gene_w_ex, ignoreTxVersion = TRUE)
+
+# Creating DESeqDataSet
+ddsTxi <- DESeqDataSetFromTximport(txi_w_ex,
+                                    colData = design_df,
+                                    design = ~ biol_rep + group) # the addition of biol_rep in the formula controls for this batch effect when testing for differential expression
+
+```
+
+```{r prefiltering}
+
+# Pre-filtering low count genes in order to speed up the following computations.
+keep <- rowSums(counts(ddsTxi)) >= 10
+ddsTxi <- ddsTxi[keep,]
+
+```
+
+```{r DESeq function}
+
+# the standard differential expression analysis steps are wrapped into a single function, DESeq
+ddsTxi <- DESeq(ddsTxi)
+
+```
+
+# PCA
+
+```{r data transformation}
+
+vsd <- vst(ddsTxi, blind = TRUE)
+
+```
+
+```{r PCA,  include = TRUE}
+
+PC_x = 1
+PC_y = 2
+pcaData <- plotPCA_data(vsd, intgroup=c("time_point", "genotype", "clone", "biol_rep"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+par(mfrow=c(2,1))
+sp1 <- ggplot(pcaData, aes(pcaData[, PC_x], pcaData[, PC_y], color=time_point, shape=genotype)) +
+  geom_point(size=4) +
+  xlab(paste0("PC",PC_x,": ",percentVar[PC_x],"% variance")) +
+  ylab(paste0("PC",PC_y,": ",percentVar[PC_y],"% variance")) +
+  coord_fixed() +
+  theme(axis.text = element_text(size = 22), axis.title = element_text(size = 22),
+        title = element_text(size = 22),
+        legend.text = element_text(size = 22), legend.title = element_text(size = 22),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+sp2 <- ggplot(pcaData, aes(pcaData[, PC_x], pcaData[, PC_y], color=clone, shape=biol_rep)) +
+  geom_point(size=4) +
+  xlab(paste0("PC",PC_x,": ",percentVar[PC_x],"% variance")) +
+  ylab(paste0("PC",PC_y,": ",percentVar[PC_y],"% variance")) +
+  coord_fixed() +
+  theme(axis.text = element_text(size = 22), axis.title = element_text(size = 22),
+        title = element_text(size = 20),
+        legend.text = element_text(size = 22), legend.title = element_text(size = 22),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+ggarrange(sp2, sp1, 
+          nrow = 2)
+
+```
+
+The main factor separating the samples is the cell clone and clone's litter (biological replicate) on PC1, then the condition dominates ordering along PC2 inside each clone's cluster.
+
+# Plotting counts for Ogt, Oga, OsTIR
+
+```{r plot counts O-GlcNAc enzymes (FIGURE), include = TRUE}
+
+my_protagonists <- c(Ogt = "ENSMUSG00000034160", Oga = "ENSMUSG00000025220", OsTIR1 = "OsTIR1_gene")
+
+my_plotCounts <- function (g, my_GOIs) {
+  if (sum(grepl(my_GOIs[g], ddsTxi@rowRanges@partitioning@NAMES)) > 0) {
+      d <- plotCounts(ddsTxi, gene = my_GOIs[g], intgroup = c("group", "condition", "genotype"), returnData = TRUE)
+      # reordering group variable for better visualization
+      d$group <- factor(d$group, levels = c("ctrlNO", "ctrl24H", "ctrl48H", "ctrl4D", "AIDOgtNO", "AIDOgt24H", "AIDOgt48H", "AIDOgt4D"))
+    ggplot(d, aes(x = group, y = count, colour = condition, shape = genotype)) + 
+      geom_point(position=position_jitter(w=0.1,h=0), size = 3) +
+      stat_summary(fun = "mean", geom = "crossbar", width = 0.5) +
+      scale_y_log10(limits = ) +
+      ggtitle(names(my_GOIs)[g]) +
+      theme(title = element_text(size = 16),
+        legend.text = element_text(size = 16), legend.title = element_text(size = 16),
+        axis.text = element_text(size = 12, angle = 60, vjust = 0.5, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+  }
+}
+
+do.call("ggarrange", args = list(plotlist = lapply(1:length(my_protagonists), my_plotCounts, my_GOIs = my_protagonists), common.legend = TRUE, legend = "right"))
+
+```
+
+# Diff Expr Analysis
+
+## P-value histograms and MA-plots for the different comparisons
+
+```{r adj pvalue cutoff}
+
+adjpvalue_cutoff <- 0.05
+
+```
+
+The threshold used for a dot to be colored in blue in the MA-plots is: p-value adjusted < `r adjpvalue_cutoff`.
+
+```{r DESeq results list}
+
+res_list <- list(
+## effect of auxin treatment on the control ("auxin effect")
+res_auxin_only_24H = lfcShrink(ddsTxi, contrast=c("group","ctrl24H","ctrlNO"), alpha=adjpvalue_cutoff, type="ashr"),
+res_auxin_only_48H = lfcShrink(ddsTxi, contrast=c("group","ctrl48H","ctrlNO"), alpha=adjpvalue_cutoff, type="ashr"),
+res_auxin_only_4D = lfcShrink(ddsTxi, contrast=c("group","ctrl4D","ctrlNO"), alpha=adjpvalue_cutoff, type="ashr"),
+## effect of genotype only independently of auxin ("hypomorphic genotype effect")
+res_geno_only = lfcShrink(ddsTxi, contrast=c("group","AIDOgtNO", "ctrlNO"), alpha=adjpvalue_cutoff, type="ashr"),
+## effect of OGT depletion on AID cells at different time points compared to auxin untreated AID cells or previous time points
+res_4D_vs_NO = lfcShrink(ddsTxi, contrast=c("group","AIDOgt4D","AIDOgtNO"), alpha=adjpvalue_cutoff, type="ashr"),
+res_48H_vs_NO = lfcShrink(ddsTxi, contrast=c("group","AIDOgt48H","AIDOgtNO"), alpha=adjpvalue_cutoff, type="ashr"),
+res_24H_vs_NO = lfcShrink(ddsTxi, contrast=c("group","AIDOgt24H","AIDOgtNO"), alpha=adjpvalue_cutoff, type="ashr"),
+res_48H_vs_24H = lfcShrink(ddsTxi, contrast=c("group","AIDOgt48H","AIDOgt24H"), alpha=adjpvalue_cutoff, type="ashr"),
+res_4D_vs_48H = lfcShrink(ddsTxi, contrast=c("group","AIDOgt4D","AIDOgt48H"), alpha=adjpvalue_cutoff, type="ashr"),
+res_4D_vs_24H = lfcShrink(ddsTxi, contrast=c("group","AIDOgt4D","AIDOgt24H"), alpha=adjpvalue_cutoff, type="ashr")
+)
+
+```
+
+```{r pvalue histograms and MA-plots, include = TRUE, fig.width=12, fig.height=15}
+
+do.call(grid.arrange, lapply(res_list, pval_hist))
+par(mfrow=c(5,2))
+lapply(res_list, MA_plot, adjpval = adjpvalue_cutoff)
+
+```
+
+## Volcano plots for the different comparisons
+
+```{r function to retrieve gene names results DESeq2}
+
+retrieve_res_names <- function (r) {
+  res_df <- data.frame(gene_id = rownames(r))
+  res_df <- merge(res_df, unique(gene_map_dt[, .(gene_name, gene_id)]), all.x = TRUE, by = "gene_id")
+  res_df$gene_name[is.na(res_df$gene_name)] <- res_df$gene_id[is.na(res_df$gene_name)]
+  return(res_df)
+}
+
+```
+
+```{r change names res list for volcanos titles}
+
+my_res_list <- res_list
+names(my_res_list) <- c("ctrl cells - 24h auxin vs untreated", "ctrl cells - 48h auxin vs untreated", "ctrl cells - 4d auxin vs untreated", "AIDOgt untreated vs ctrl untreated (hypomoprhic genotype effect)", "AIDOgt cells - 4d auxin vs untreated", "AIDOgt cells - 48h auxin vs untreated", "AIDOgt cells - 24h auxin vs untreated", "AIDOgt cells - 48h auxin vs 24h auxin", "AIDOgt cells - 4d auxin vs 48h auxin", "AIDOgt cells - 4d auxin vs 24h auxin")
+
+```
+
+```{r volcano plots (FIGURES), include = TRUE, echo=TRUE}
+
+library(EnhancedVolcano)
+
+volcano_plot <- function (i, my_res_list) {
+  res_names <- retrieve_res_names(my_res_list[[i]])
+  EnhancedVolcano(my_res_list[[i]], lab = res_names$gene_name, x = 'log2FoldChange', y = 'pvalue', xlim = c(-3,3), ylim = c(0,60),
+                  FCcutoff = 0.3,
+                  title = names(my_res_list)[i],
+                  labSize = 3,
+                  max.overlaps = 30,
+                  drawConnectors = TRUE)
+}
+
+lapply(1:7, volcano_plot, my_res_list = my_res_list)
+
+```
+
+## Getting DE genes, ordered by p-value
+
+Getting the DE genes (padj < `r adjpvalue_cutoff`, any log2FC), ordered by pvalue.
+
+```{r function to rank DE genes}
+
+# Function which takes a DESeq results object and return it as a dataframe, with genes ordered by pvalue, filtered by adjusted pvalue and with gene names added; furthermore it writes this dataframe to a file if desired
+pvalue_ranked_DE <- function (my_res, my_DE_dir, writeToFile, my_adjpval, my_gene_name_mapping_table) {
+  # getting name of contrast
+  contrast_name <- gsub(" ", "_", gsub("(.*group )|(.*: )", "", mcols(my_res)$description[4]))
+  # removing genes for which padj is NA
+  my_res <- my_res[!(is.na(my_res$padj)), ]
+  # merging the dataframe with the gene names
+  my_res$gene_id <- row.names(my_res)
+  my_res <- merge(as.data.frame(my_res), my_gene_name_mapping_table, by = "gene_id", all.x = TRUE)
+  # ordering by pvalue
+  my_res_ord <- my_res[order(my_res$pvalue),]
+  # keeping only the ones with padj below desired threshold
+  my_res_ord_f <- my_res_ord[my_res_ord$padj < my_adjpval, ]
+  # writing them to file
+  if (writeToFile) {
+    # creating output directory if it does not exist
+    system(paste0("[ -d ", my_DE_dir, " ] || mkdir -p ", my_DE_dir))
+    write.csv(my_res_ord_f, file=paste0(my_DE_dir, contrast_name, "_DEG_by_pvalue.csv"))
+  }
+  return(my_res_ord_f)
+}
+
+```
+
+```{r DE dir}
+
+# Defining export directory
+DE_dir <- "../../analysis/DESeq/"
+
+```
+
+```{r ordering and eventually exporting DE genes}
+
+pvalue_ranked_DE_list <- lapply(res_list, pvalue_ranked_DE, my_DE_dir = DE_dir, writeToFile = TRUE, my_adjpval = adjpvalue_cutoff, my_gene_name_mapping_table = geneID2name_w_ex)
+
+```
+
+## DE genes over-representation tests
+
+I use the DE genes observed in AID cells after 24h/48h/4d of auxin treatment (compared to the NO auxin condition), after exclusion of the DE genes observed by treating ctrl cells with auxin at any of the three time points. 
+
+### Overlap between groups of DEGs
+
+```{r excluding aux genes}
+
+# Removing the genes DE in ctrl cells treated with auxin from the DE genes in 24h/48h/4d treated AID cells vs untreated AID cells
+aux_genes <- unique(c(pvalue_ranked_DE_list$res_auxin_only_4D$gene_id, pvalue_ranked_DE_list$res_auxin_only_24H$gene_id, pvalue_ranked_DE_list$res_auxin_only_48H$gene_id))
+res_24H_vs_NO_auxin_exclus <- pvalue_ranked_DE_list$res_24H_vs_NO[!(pvalue_ranked_DE_list$res_24H_vs_NO$gene_id %in% aux_genes), ]
+res_48H_vs_NO_auxin_exclus <- pvalue_ranked_DE_list$res_48H_vs_NO[!(pvalue_ranked_DE_list$res_48H_vs_NO$gene_id %in% aux_genes), ]
+res_4D_vs_NO_auxin_exclus <- pvalue_ranked_DE_list$res_4D_vs_NO[!(pvalue_ranked_DE_list$res_4D_vs_NO$gene_id %in% aux_genes), ]
+
+f_DE_dt_list <- list(pvalue_ranked_DE_list$res_geno_only, res_24H_vs_NO_auxin_exclus, res_48H_vs_NO_auxin_exclus, res_4D_vs_NO_auxin_exclus)
+names(f_DE_dt_list) <- c("genotype", "24h auxin on AID-Ogt cells", "48h auxin on AID-Ogt cells", "4d auxin on AID-Ogt cells")
+f_DE_genes_list <- list(pvalue_ranked_DE_list$res_geno_only$gene_id, res_24H_vs_NO_auxin_exclus$gene_id, res_48H_vs_NO_auxin_exclus$gene_id, res_4D_vs_NO_auxin_exclus$gene_id, aux_genes)
+names(f_DE_genes_list) <- c("genotype", "24h auxin on AID-Ogt cells", "48h auxin on AID-Ogt cells", "4d auxin on AID-Ogt cells", "auxin on ctrl cells")
+
+```
+
+Overlap of DEGs due to OGT depletion with DEGs due to auxin effect on ctrl cells: 
+
+```{r venn OGT-depletion DEGs with auxin effect DEGs, include = TRUE}
+
+venn(list(`24h treatment of AID-Ogt cells` = pvalue_ranked_DE_list$res_24H_vs_NO$gene_id, `auxin treatment of control cells` = aux_genes), show.plot=TRUE)
+venn(list(`48h treatment of AID-Ogt cells` = pvalue_ranked_DE_list$res_48H_vs_NO$gene_id, `auxin treatment of control cells` = aux_genes), show.plot=TRUE)
+venn(list(`4d treatment of AID-Ogt cells` = pvalue_ranked_DE_list$res_4D_vs_NO$gene_id, `auxin treatment of control cells` = aux_genes), show.plot=TRUE)
+
+```
+
+Overlap of DEGs at different time points of OGT depletion (auxin effect's DEGs were excluded):
+
+```{r separating up and down}
+
+f_DE_genes_list_up <- list(pvalue_ranked_DE_list$res_geno_only$gene_id[pvalue_ranked_DE_list$res_geno_only$log2FoldChange > 0], res_24H_vs_NO_auxin_exclus$gene_id[res_24H_vs_NO_auxin_exclus$log2FoldChange > 0], res_48H_vs_NO_auxin_exclus$gene_id[res_48H_vs_NO_auxin_exclus$log2FoldChange > 0], res_4D_vs_NO_auxin_exclus$gene_id[res_4D_vs_NO_auxin_exclus$log2FoldChange > 0], pvalue_ranked_DE_list$res_auxin_only_4D$gene_id[pvalue_ranked_DE_list$res_auxin_only_4D$log2FoldChange > 0])
+names(f_DE_genes_list_up) <- c("genotype - up", "24h auxin on AID-Ogt cells - up", "48h auxin on AID-Ogt cells - up", "4d auxin on AID-Ogt cells - up", "4d auxin on ctrl cells - up")
+
+f_DE_genes_list_down <- list(pvalue_ranked_DE_list$res_geno_only$gene_id[pvalue_ranked_DE_list$res_geno_only$log2FoldChange < 0], res_24H_vs_NO_auxin_exclus$gene_id[res_24H_vs_NO_auxin_exclus$log2FoldChange < 0], res_48H_vs_NO_auxin_exclus$gene_id[res_48H_vs_NO_auxin_exclus$log2FoldChange < 0], res_4D_vs_NO_auxin_exclus$gene_id[res_4D_vs_NO_auxin_exclus$log2FoldChange < 0], pvalue_ranked_DE_list$res_auxin_only_4D$gene_id[pvalue_ranked_DE_list$res_auxin_only_4D$log2FoldChange < 0])
+names(f_DE_genes_list_down) <- c("genotype - down", "24h auxin on AID-Ogt cells - down", "48h auxin on AID-Ogt cells - down", "4d auxin on AID-Ogt cells - down", "4d auxin on ctrl cells - down")
+
+```
+
+```{r venn DE genes up and down (FIGURE), include = TRUE}
+
+venn(list(`24H treatment of AID-Ogt cells up` = f_DE_genes_list_up$`24h auxin on AID-Ogt cells - up`, `48H treatment of AID-Ogt cells up` = f_DE_genes_list_up$`48h auxin on AID-Ogt cells - up`, `4d treatment of AID-Ogt cells up` = f_DE_genes_list_up$`4d auxin on AID-Ogt cells - up`), show.plot=TRUE)
+
+venn(list(`24H treatment of AID-Ogt cells down` = f_DE_genes_list_down$`24h auxin on AID-Ogt cells - down`, `48H treatment of AID-Ogt cells down` = f_DE_genes_list_down$`48h auxin on AID-Ogt cells - down`, `4d treatment of AID-Ogt cells down` = f_DE_genes_list_down$`4d auxin on AID-Ogt cells - down`), show.plot=TRUE)
+
+```
+
+```{r test overlap, include = TRUE}
+
+library(GeneOverlap)
+
+expr_MEFs <- rownames(ddsTxi)[rowMeans(counts(ddsTxi, normalized = TRUE)) > 10]
+
+go.obj_geno_24h_48h_up <- newGeneOverlap(f_DE_genes_list_up$`24h auxin on AID-Ogt cells - up`, f_DE_genes_list_up$`48h auxin on AID-Ogt cells - up`, genome.size=length(expr_MEFs))
+go.obj_geno_24h_4d_up <- newGeneOverlap(f_DE_genes_list_up$`24h auxin on AID-Ogt cells - up`, f_DE_genes_list_up$`4d auxin on AID-Ogt cells - up`, genome.size=length(expr_MEFs))
+go.obj_geno_48h_4d_up <- newGeneOverlap(f_DE_genes_list_up$`48h auxin on AID-Ogt cells - up`, f_DE_genes_list_up$`4d auxin on AID-Ogt cells - up`, genome.size=length(expr_MEFs))
+go.obj_geno_4d_aux4d_up <- newGeneOverlap(pvalue_ranked_DE_list$res_auxin_only_4D$gene_id[pvalue_ranked_DE_list$res_auxin_only_4D$log2FoldChange > 0], pvalue_ranked_DE_list$res_4D_vs_NO$gene_id[pvalue_ranked_DE_list$res_4D_vs_NO$log2FoldChange > 0], genome.size=length(expr_MEFs))
+
+go.obj_geno_24h_48h_up <- testGeneOverlap(go.obj_geno_24h_48h_up)
+go.obj_geno_24h_4d_up <- testGeneOverlap(go.obj_geno_24h_4d_up)
+go.obj_geno_48h_4d_up <- testGeneOverlap(go.obj_geno_48h_4d_up)
+go.obj_geno_4d_aux4d_up <- testGeneOverlap(go.obj_geno_4d_aux4d_up)
+
+go.obj_geno_24h_48h_down <- newGeneOverlap(f_DE_genes_list_down$`24h auxin on AID-Ogt cells - down`, f_DE_genes_list_down$`48h auxin on AID-Ogt cells - down`, genome.size=length(expr_MEFs))
+go.obj_geno_24h_4d_down <- newGeneOverlap(f_DE_genes_list_down$`24h auxin on AID-Ogt cells - down`, f_DE_genes_list_down$`4d auxin on AID-Ogt cells - down`, genome.size=length(expr_MEFs))
+go.obj_geno_48h_4d_down <- newGeneOverlap(f_DE_genes_list_down$`48h auxin on AID-Ogt cells - down`, f_DE_genes_list_down$`4d auxin on AID-Ogt cells - down`, genome.size=length(expr_MEFs))
+go.obj_geno_4d_aux4d_down <- newGeneOverlap(pvalue_ranked_DE_list$res_auxin_only_4D$gene_id[pvalue_ranked_DE_list$res_auxin_only_4D$log2FoldChange < 0], pvalue_ranked_DE_list$res_4D_vs_NO$gene_id[pvalue_ranked_DE_list$res_4D_vs_NO$log2FoldChange > 0], genome.size=length(expr_MEFs))
+
+go.obj_geno_24h_48h_down <- testGeneOverlap(go.obj_geno_24h_48h_down)
+go.obj_geno_24h_4d_down <- testGeneOverlap(go.obj_geno_24h_4d_down)
+go.obj_geno_48h_4d_down <- testGeneOverlap(go.obj_geno_48h_4d_down)
+go.obj_geno_4d_aux4d_down <- testGeneOverlap(go.obj_geno_4d_aux4d_down)
+
+
+```
+
+Pvalues of overlaps for upregulated DEGs are:
+
+* `r go.obj_geno_24h_48h_up@pval` for AID-Ogt 24h aux & AID-Ogt 48h aux, both w/o auxin-effect genes
+* `r go.obj_geno_24h_4d_up@pval` for AID-Ogt 24h aux & AID-Ogt 4d aux, both w/o auxin-effect genes
+* `r go.obj_geno_48h_4d_up@pval` for AID-Ogt 48h aux & AID-Ogt 4d aux, both w/o auxin-effect genes
+* `r go.obj_geno_4d_aux4d_up@pval` for AID-Ogt 4d aux & 4d aux on ctrl cells
+
+Pvalues of overlaps for downregulated DEGs are:
+
+* `r go.obj_geno_24h_48h_down@pval` for AID-Ogt 24h aux & AID-Ogt 48h aux, both w/o auxin-effect genes
+* `r go.obj_geno_24h_4d_down@pval` for AID-Ogt 24h aux & AID-Ogt 4d aux, both w/o auxin-effect genes
+* `r go.obj_geno_48h_4d_down@pval` for AID-Ogt 48h aux & AID-Ogt 4d aux, both w/o auxin-effect genes
+* `r go.obj_geno_4d_aux4d_down@pval` for AID-Ogt 4d aux & 4d aux on ctrl cells
+
+<n>
+
+Note that:
+
+* pval decreases for with longer treatment --> effects at 48h and 4d time points are more similar between each other than to the 24h time point
+* the pval is much higher when comparing 4d-treated AID-Ogt cells and 4d-treated control cells.
+
+### Gene Ontology Over-representation Test - up and downregulated genes separately
+
+```{r all GO Enrichment Test function}
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+### Function which: 1) perform the GO Over-representation Test for Biological Process, Molecular Function and Cellular Component 2) filter for a level of GO terms, 3) simplify the result by grouping those terms which have correlation > 0.7 (keeping only the one with the minimum q-value among the GO terms of one group) 
+perform_all_go_ora <- function (my_DE_genes, f_level) {
+  BP <- enrichGO(gene = my_DE_genes,
+                 universe = keys(org.Mm.eg.db, keytype="ENSEMBL"),
+                 OrgDb = org.Mm.eg.db, 
+                 keyType = "ENSEMBL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.1,
+                 readable = TRUE)
+  BP_f <- gofilter(BP, level = f_level)
+  MF <- enrichGO(gene = my_DE_genes,
+                 universe = keys(org.Mm.eg.db, keytype="ENSEMBL"),
+                 OrgDb = org.Mm.eg.db, 
+                 keyType = "ENSEMBL",
+                 ont = "MF",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.1,
+                 readable = TRUE)
+  MF_f <- gofilter(MF, level = f_level)
+  CC <- enrichGO(gene = my_DE_genes,
+                 universe = keys(org.Mm.eg.db, keytype="ENSEMBL"),
+                 OrgDb = org.Mm.eg.db, 
+                 keyType = "ENSEMBL",
+                 ont = "CC",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.1,
+                 readable = TRUE)
+  CC_f <- gofilter(CC, level = f_level)
+  return(lapply(list(BP_f, MF_f, CC_f), function (GO_f) {simplify(GO_f, cutoff=0.6, by="qvalue", select_fun=min)}))
+}
+
+```
+
+```{r all GO Enrichment Test up and down separately}
+
+all_go_ora_UP_DE_genes_auxinExl_list <- lapply(f_DE_genes_list_up, perform_all_go_ora, f_level = 5)
+names(all_go_ora_UP_DE_genes_auxinExl_list) <- c("genotype - up", "24h auxin on AID-Ogt cells - up", "48h auxin on AID-Ogt cells - up", "4d auxin on AID-Ogt cells - up", "4d auxin on ctrl cells - up")
+all_go_ora_DOWN_DE_genes_auxinExl_list <- lapply(f_DE_genes_list_down, perform_all_go_ora, f_level = 5)
+names(all_go_ora_DOWN_DE_genes_auxinExl_list) <- c("genotype - down", "24h auxin on AID-Ogt cells - down", "48h auxin on AID-Ogt cells - down", "4d auxin on AID-Ogt cells - down", "4d auxin on ctrl cells - down")
+
+```
+
+```{r table of GO, results='asis'}
+
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[1]]), caption = "genotype effect - BP up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[3]]), caption = "genotype effect - CC up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[2]]), caption = "genotype effect - MF up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[1]]), caption = "24h auxin on AID-Ogt cells - BP up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[3]]), caption = "24h auxin on AID-Ogt cells - CC up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[2]]), caption = "24h auxin on AID-Ogt cells - MF up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[1]]), caption = "48h auxin on AID-Ogt cells - BP up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[3]]), caption = "48h auxin on AID-Ogt cells - CC up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[2]]), caption = "48h auxin on AID-Ogt cells - MF up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[1]]), caption = "4d auxin on AID-Ogt cells - BP up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[3]]), caption = "4d auxin on AID-Ogt cells - CC up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[2]]), caption = "4d auxin on AID-Ogt cells - MF up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[1]]), caption = "4d auxin on ctrl cells - BP up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[3]]), caption = "4d auxin on ctrl cells - CC up")
+knitr::kable(as.data.frame(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[2]]), caption = "4d auxin on ctrl cells - MF up")
+
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[1]]), caption = "genotype effect - BP down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[3]]), caption = "genotype effect - CC down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[2]]), caption = "genotype effect - MF down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[1]]), caption = "24h auxin on AID-Ogt cells - BP down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[3]]), caption = "24h auxin on AID-Ogt cells - CC down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[2]]), caption = "24h auxin on AID-Ogt cells - MF down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[1]]), caption = "48h auxin on AID-Ogt cells - BP down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[3]]), caption = "48h auxin on AID-Ogt cells - CC down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[2]]), caption = "48h auxin on AID-Ogt cells - MF down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[1]]), caption = "4d auxin on AID-Ogt cells - BP down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[3]]), caption = "4d auxin on AID-Ogt cells - CC down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[2]]), caption = "4d auxin on AID-Ogt cells - MF down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[1]]), caption = "4d auxin on ctrl cells - BP down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[3]]), caption = "4d auxin on ctrl cells - CC down")
+knitr::kable(as.data.frame(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[2]]), caption = "4d auxin on ctrl cells - MF down")
+
+```
+
+```{r GO Enrichment Test plot BP (FIGURE), include = TRUE}
+
+combined_BP_up_GO_df <- rbind(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[1]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[1]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[1]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[1]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[1]]))
+combined_BP_up_GO_df$time_point <- c(rep("genotype", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[1]]))), rep("24h", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[1]]))), rep("48h", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[1]]))), rep("4d", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[1]]))), rep("auxin", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[1]]))))
+combined_BP_down_GO_df <- rbind(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[1]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[1]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[1]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[1]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[1]]))
+combined_BP_down_GO_df$time_point <- c(rep("genotype", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[1]]))), rep("24h", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[1]]))), rep("48h", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[1]]))), rep("4d", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[1]]))), rep("auxin", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[1]]))))
+combined_BP_GO_df <- rbind(combined_BP_up_GO_df, combined_BP_down_GO_df)
+combined_BP_GO_df$sign <- c(rep("up", nrow(combined_BP_up_GO_df)), rep("down", nrow(combined_BP_down_GO_df)))
+  
+# relevel time point variable for visualization
+combined_BP_GO_df$time_point <- factor(combined_BP_GO_df$time_point, levels = c("genotype", "24h", "48h", "4d", "auxin"))
+# ID of first 25 terms based on GeneRatio
+combined_BP_GO_df$total_DEGs <- as.integer(gsub(".*/", "", combined_BP_GO_df$GeneRatio))  
+combined_BP_GO_df$GeneRatio_num <- combined_BP_GO_df$Count / combined_BP_GO_df$total_DEGs
+setorder(combined_BP_GO_df, pvalue)
+best_terms <- combined_BP_GO_df$ID[1:25]
+combined_BP_GO_select <- combined_BP_GO_df[ID %in% best_terms]
+
+ggplot(combined_BP_GO_select, aes(x = GeneRatio_num, y = reorder_within(Description, GeneRatio_num, sign), color = p.adjust)) +
+      scale_color_continuous(low="red", high="blue", name = "p.adjust", guide = guide_colorbar(reverse=TRUE)) +
+      geom_point(aes(size=Count)) +
+      scale_y_reordered() +
+      scale_size(range=c(0.5, 5)) +
+      ylab(NULL) +
+      theme_dose(10) +
+      facet_grid(sign ~ time_point, scales = "free_y") +
+      theme(title = element_text(size = 18),
+            legend.text = element_text(size = 10), legend.title = element_text(size = 8))
+
+```
+
+```{r combined CC df}
+
+combined_CC_up_GO_df <- rbind(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[3]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[3]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[3]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[3]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[3]]))
+combined_CC_up_GO_df$time_point <- c(rep("genotype", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[3]]))), rep("24h", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[3]]))), rep("48h", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[3]]))), rep("4d", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[3]]))), rep("auxin", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[3]]))))
+combined_CC_down_GO_df <- rbind(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[3]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[3]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[3]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[3]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[3]]))
+combined_CC_down_GO_df$time_point <- c(rep("genotype", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[3]]))), rep("24h", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[3]]))), rep("48h", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[3]]))), rep("4d", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[3]]))), rep("auxin", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[3]]))))
+combined_CC_GO_df <- rbind(combined_CC_up_GO_df, combined_CC_down_GO_df)
+combined_CC_GO_df$sign <- c(rep("up", nrow(combined_CC_up_GO_df)), rep("down", nrow(combined_CC_down_GO_df)))
+  
+# relevel time point variable for visualization
+combined_CC_GO_df$time_point <- factor(combined_CC_GO_df$time_point, levels = c("genotype", "auxin", "24h", "48h", "4d"))
+
+# compute gene ratio
+combined_CC_GO_df$total_DEGs <- as.integer(gsub(".*/", "", combined_CC_GO_df$GeneRatio))  
+combined_CC_GO_df$GeneRatio_num <- combined_CC_GO_df$Count / combined_CC_GO_df$total_DEGs
+
+```
+
+```{r combined MF df}
+
+combined_MF_up_GO_df <- rbind(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[2]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[2]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[2]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[2]]), as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[2]]))
+combined_MF_up_GO_df$time_point <- c(rep("genotype", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[1]][[2]]))), rep("24h", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[2]][[2]]))), rep("48h", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[3]][[2]]))), rep("4d", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[4]][[2]]))), rep("auxin", nrow(as.data.table(all_go_ora_UP_DE_genes_auxinExl_list[[5]][[2]]))))
+combined_MF_down_GO_df <- rbind(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[2]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[2]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[2]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[2]]), as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[2]]))
+combined_MF_down_GO_df$time_point <- c(rep("genotype", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[1]][[2]]))), rep("24h", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[2]][[2]]))), rep("48h", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[3]][[2]]))), rep("4d", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[4]][[2]]))), rep("auxin", nrow(as.data.table(all_go_ora_DOWN_DE_genes_auxinExl_list[[5]][[2]]))))
+combined_MF_GO_df <- rbind(combined_MF_up_GO_df, combined_MF_down_GO_df)
+combined_MF_GO_df$sign <- c(rep("up", nrow(combined_MF_up_GO_df)), rep("down", nrow(combined_MF_down_GO_df)))
+  
+# relevel time point variable for visualization
+combined_MF_GO_df$time_point <- factor(combined_MF_GO_df$time_point, levels = c("genotype", "auxin", "24h", "48h", "4d"))
+
+# compute gene ratio
+combined_MF_GO_df$total_DEGs <- as.integer(gsub(".*/", "", combined_MF_GO_df$GeneRatio))  
+combined_MF_GO_df$GeneRatio_num <- combined_MF_GO_df$Count / combined_MF_GO_df$total_DEGs
+
+```
+
+```{r combined GO Enrichment Test plot CC MF (FIGURE), fig.width=18}
+
+combined_CC_MF_df <- rbind(combined_CC_GO_df, combined_MF_GO_df)
+combined_CC_MF_df$GO <- c(rep("CC", nrow(combined_CC_GO_df)), rep("MF", nrow(combined_MF_GO_df)))
+setorder(combined_CC_MF_df, GO, pvalue)
+best_terms <- combined_CC_MF_df[, .SD[1:25], by=c("GO"), .SDcols = "ID"]$ID
+combined_CC_MF_select <- combined_CC_MF_df[ID %in% best_terms]
+
+ggplot(combined_CC_MF_select[Description != "vesicle coat"], aes(x = GeneRatio_num, y = reorder_within(Description, GeneRatio_num, sign), color = p.adjust)) +
+      scale_color_continuous(low="red", high="blue", name = "p.adjust", guide = guide_colorbar(reverse=TRUE)) +
+      geom_point(aes(size=Count)) +
+      scale_y_reordered() +
+      scale_size(range=c(0.5, 5)) +
+      ylab(NULL) +
+      theme_dose(10) +
+      facet_grid(sign * GO ~ time_point, scales = "free_y") +
+      theme(title = element_text(size = 18),
+            legend.text = element_text(size = 10), legend.title = element_text(size = 8))
+
+```
+
+### MSigDb Set Enrichment Test
+
+```{r MSigDb retrieval}
+
+library(msigdbr)
+
+# retrieving all mouse gene sets 
+msigdb_df <- msigdbr(species = "Mus musculus")
+save(msigdb_df, file = "msigdb_df.Rdata")
+
+```
+
+```{r MSigDb set enrichment test, eval = FALSE}
+
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "mmusculus_gene_ensembl")
+
+### Function which takes a DESeq result table and perform the MSigDb Gene Set Enrichment Test for a specific MSigDB gene set
+perform_msigdb_gsea <- function (msigdb_set, my_DE_genes_dt, my_msigdb_df = msigdb_df) {
+  # selecting only specific gene set and only columns specifying gene set name and entrez gene ID
+  my_msigdb_set <- my_msigdb_df[my_msigdb_df$gs_cat == msigdb_set, c("gs_name", "entrez_gene")]
+  # retrieving GOIs entrez IDs from biomart
+  goi_ensembl_entrez <- DataFrame(getBM(attributes = c('ensembl_gene_id', 'entrezgene_id'), filters = 'ensembl_gene_id', values = my_DE_genes_dt$gene_id, mart = ensembl))
+  my_DE_genes_dt_entrez <- merge(as.data.table(my_DE_genes_dt), goi_ensembl_entrez, by.x = "gene_id", by.y = "ensembl_gene_id")
+  my_DE_genes_dt_entrez <- my_DE_genes_dt_entrez[my_DE_genes_dt_entrez$baseMean > 10, ]
+  my_DE_genes_dt_entrez$my_rank_stat <- -log10(my_DE_genes_dt_entrez$pvalue)*sign(my_DE_genes_dt_entrez$log2FoldChange)
+  # gene list for GSEA needs to be sorted in decreasing order
+  my_DE_genes_dt_entrez <- my_DE_genes_dt_entrez[order(my_DE_genes_dt_entrez$my_rank_stat, decreasing = TRUE), ]
+  my_gene_list <- setNames(object = my_DE_genes_dt_entrez$my_rank_stat, nm = my_DE_genes_dt_entrez$entrezgene_id)
+  fc_vector <- my_DE_genes_dt_entrez$log2FoldChange
+  names(fc_vector) <- my_DE_genes_dt_entrez$entrezgene_id
+  gsea_res <- GSEA(my_gene_list, TERM2GENE = my_msigdb_set)
+  # substituting entrez ID with gene symbols
+  gsea_res <- setReadable(gsea_res, 'org.Mm.eg.db', 'ENTREZID')
+  return(list(gsea_res,fc_vector))
+}
+
+# apply the function to my GOIs
+msigdb_H_gsea_list <- lapply(f_DE_dt_list, perform_msigdb_gsea, msigdb_set = "H")
+msigdb_c2_gsea_list <- lapply(f_DE_dt_list, perform_msigdb_gsea, msigdb_set = "C2")
+msigdb_c3_gsea_list <- lapply(f_DE_dt_list, perform_msigdb_gsea, msigdb_set = "C3")
+
+```
+
+```{r msigdb enrichment result, results='asis', eval = FALSE}
+
+knitr::kable(as.data.frame(msigdb_H_gsea_list[[1]][[1]]), caption = "H dataset - genotype only")
+knitr::kable(as.data.frame(msigdb_H_gsea_list[[2]][[1]]), caption = "H dataset - 24h auxin on AID-Ogt cells")
+knitr::kable(as.data.frame(msigdb_H_gsea_list[[3]][[1]]), caption = "H dataset - 48h auxin on AID-Ogt cells")
+knitr::kable(as.data.frame(msigdb_H_gsea_list[[4]][[1]]), caption = "H dataset - 4d auxin on AID-Ogt cells")
+
+knitr::kable(as.data.frame(msigdb_c2_gsea_list[[1]][[1]]), caption = "C2 dataset - genotype only")
+knitr::kable(as.data.frame(msigdb_c2_gsea_list[[2]][[1]]), caption = "C2 dataset - 24h auxin on AID-Ogt cells")
+knitr::kable(as.data.frame(msigdb_c2_gsea_list[[3]][[1]]), caption = "C2 dataset - 48h auxin on AID-Ogt cells")
+knitr::kable(as.data.frame(msigdb_c2_gsea_list[[4]][[1]]), caption = "C2 dataset - 4d auxin on AID-Ogt cells")
+
+knitr::kable(as.data.frame(msigdb_c3_gsea_list[[1]][[1]]), caption = "C3 dataset - genotype only")
+knitr::kable(as.data.frame(msigdb_c3_gsea_list[[2]][[1]]), caption = "C3 dataset - 24h auxin on AID-Ogt cells")
+knitr::kable(as.data.frame(msigdb_c3_gsea_list[[3]][[1]]), caption = "C3 dataset - 48h auxin on AID-Ogt cells")
+knitr::kable(as.data.frame(msigdb_c3_gsea_list[[4]][[1]]), caption = "C3 dataset - 4d auxin on AID-Ogt cells")
+
+```
+
+```{r msigdb enrichment cnetplot (FIGURE), include = TRUE, eval = FALSE}
+
+cnetplot(msigdb_H_gsea_list[[1]][[1]], foldChange=msigdb_H_gsea_list[[1]][[2]]) +
+  ggtitle("H dataset - genotype only")
+cnetplot(msigdb_H_gsea_list[[2]][[1]], foldChange=msigdb_H_gsea_list[[2]][[2]]) +
+  ggtitle("H dataset - 24h auxin on AID-Ogt cells")
+cnetplot(msigdb_H_gsea_list[[3]][[1]], foldChange=msigdb_H_gsea_list[[3]][[2]]) +
+  ggtitle("H dataset - 48h auxin on AID-Ogt cells")
+cnetplot(msigdb_H_gsea_list[[4]][[1]], foldChange=msigdb_H_gsea_list[[4]][[2]]) +
+  ggtitle("H dataset - 4d auxin on AID-Ogt cells")
+
+```
+
+```{r sessioninfo, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```
