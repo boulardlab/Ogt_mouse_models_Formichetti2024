@@ -1,8 +1,10 @@
 *
 !README.md
 !.gitignore
+!sequencing/
 sequencing/*
 !sequencing/samples_table.csv
+!embryo_public_data_GSE66582_GSE76505/
 embryo_public_data_GSE66582_GSE76505/*
 !embryo_public_data_GSE66582_GSE76505/sequencing/
 embryo_public_data_GSE66582_GSE76505/sequencing/*
