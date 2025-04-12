@@ -1,8 +1,8 @@
-# Formichetti et al., 2024 - A murine allelic series of *Ogt* catalytic hypomorphic mutants uncovers the requirement of O-GlcNAc for embryonic development
+# Formichetti et al., 2025 - A murine allelic series of *Ogt* catalytic hypomorphic mutants uncovers the requirement of O-GlcNAc for embryonic development
 
 # Introduction
 
-* This repository contains all code used to generate the figures and conclusions based on RNA-Seq data contained in paper "A murine allelic series of *Ogt* catalytic hypomorphic mutants uncovers the requirement of O-GlcNAc for embryonic development" ([Formichetti et al. 2024](link to biorxiv to add)).
+* This repository contains all code used to generate the figures and conclusions based on RNA-Seq data contained in paper "A murine allelic series of *Ogt* catalytic hypomorphic mutants uncovers the requirement of O-GlcNAc for embryonic development" ([Formichetti et al. 2025](https://journals.plos.org/plosgenetics/article?id=10.1371/journal.pgen.1011507)).
 
 * For each sequencing dataset, there is a subrepository with a self-explanatory name.
 
